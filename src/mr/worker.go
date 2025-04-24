@@ -61,9 +61,9 @@ func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 	fmt.Println("Worker running...")
 	args := ArgsType{Send_type: RPC_SEND_REQUEST}
-	reply := ReplyType{}
 	is_done := false
 	for {
+		reply := ReplyType{}
 		ok := call("Coordinator.Handle", args, &reply)
 		if ok {
 			switch reply.Reply_type {
@@ -74,7 +74,7 @@ func Worker(mapf func(string, string) []KeyValue,
 			case RPC_REPLY_DONE:
 				is_done = true
 			case RPC_REPLY_WAIT:
-				time.Sleep(3 * time.Second)
+				time.Sleep(1 * time.Second / 2)
 			}
 		} else {
 			log.Fatalf("rpc send error")
@@ -148,11 +148,13 @@ func do_reduce(id int, nMap int, reducef func(string, []string) string) {
 
 		//初始化堆
 		var kv KeyValue
-		_ = dec.Decode(&kv)
-		heap.Push(h, Merge{
-			kv:    kv,
-			index: i,
-		})
+		err = dec.Decode(&kv)
+		if err != io.EOF {
+			heap.Push(h, Merge{
+				kv:    kv,
+				index: i,
+			})
+		}
 
 		defer file.Close()
 	}
@@ -163,7 +165,7 @@ func do_reduce(id int, nMap int, reducef func(string, []string) string) {
 
 		var kv KeyValue
 		err := reducefiles[merge.index].Decode(&kv)
-		if err != nil { //已读完
+		if err != io.EOF { //已读完
 		} else {
 			heap.Push(h, Merge{
 				kv:    kv,
