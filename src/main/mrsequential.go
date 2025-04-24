@@ -77,7 +77,7 @@ func main() {
 		}
 		output := reducef(intermediate[i].Key, values)
 
-		// this is the correct format for each line of Reduce output.
+		// this is the correct format for each line of Reduce indexeroutput.
 		fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
 
 		i = j

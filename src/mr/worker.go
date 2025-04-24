@@ -1,77 +1,215 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
+import (
+	"container/heap"
+	"encoding/json"
+	"fmt"
+	"hash/fnv"
+	"io"
+	"log"
+	"net/rpc"
+	"os"
+	"sort"
+	"time"
+)
 
-
-//
 // Map functions return a slice of KeyValue.
-//
+
+type ByKey []KeyValue
+type MinHeap []Merge
 type KeyValue struct {
 	Key   string
 	Value string
 }
 
-//
+type Merge struct {
+	kv    KeyValue
+	index int
+}
+
+func (h *MinHeap) Len() int               { return len(*h) }
+func (h *MinHeap) Less(i int, j int) bool { return (*h)[i].kv.Key < (*h)[j].kv.Key }
+func (h *MinHeap) Swap(i int, j int)      { (*h)[i], (*h)[j] = (*h)[j], (*h)[i] }
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
+
+func (h *MinHeap) Push(x interface{}) {
+	*h = append(*h, x.(Merge))
+}
+
+func (h *MinHeap) Pop() interface{} {
+	old := *h
+	n := len(old)
+	item := old[n-1]
+	*h = old[0 : n-1]
+	return item
+}
+
 // use ihash(key) % NReduce to choose the reduce
 // task number for each KeyValue emitted by Map.
-//
 func ihash(key string) int {
 	h := fnv.New32a()
 	h.Write([]byte(key))
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-
-//
 // main/mrworker.go calls this function.
-//
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
-
-	// Your worker implementation here.
-
-	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
+	fmt.Println("Worker running...")
+	args := ArgsType{Send_type: RPC_SEND_REQUEST}
+	reply := ReplyType{}
+	is_done := false
+	for {
+		ok := call("Coordinator.Handle", args, &reply)
+		if ok {
+			switch reply.Reply_type {
+			case RPC_REPLY_REDUCE:
+				go do_reduce(reply.ID, reply.NMap, reducef)
+			case RPC_REPLY_MAP:
+				go do_map(reply.ID, reply.File, reply.NReduce, mapf)
+			case RPC_REPLY_DONE:
+				is_done = true
+			case RPC_REPLY_WAIT:
+				time.Sleep(3 * time.Second)
+			}
+		} else {
+			log.Fatalf("rpc send error")
+		}
+		if is_done {
+			break
+		}
+	}
 
 }
 
-//
-// example function to show how to make an RPC call to the coordinator.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func CallExample() {
+func do_map(id int, filename string, nReduce int, mapf func(string, string) []KeyValue) {
+	file, err := os.Open(filename)
+	if err != nil {
+		log.Fatalf("cannot open %v", filename)
+		call_done(id, RPC_SEND_ERROR)
+	}
+	content, err := io.ReadAll(file)
+	if err != nil {
+		log.Fatalf("cannot read read %v", filename)
+		call_done(id, RPC_SEND_ERROR)
+	}
+	file.Close()
 
-	// declare an argument structure.
-	args := ExampleArgs{}
+	kva := mapf(filename, string(content))
+	sort.Sort(ByKey(kva))
 
-	// fill in the argument(s).
-	args.X = 99
+	var reducefiles []*json.Encoder
 
-	// declare a reply structure.
-	reply := ExampleReply{}
+	for i := 0; i < nReduce; i++ {
+		jsonname := fmt.Sprintf("mr-%v-%v", id, i)
+		file, err := os.Create(jsonname)
+		if err != nil {
+			log.Fatalf("cannot create file %v", jsonname)
+			call_done(id, RPC_SEND_ERROR)
+		}
+		enc := json.NewEncoder(file)
+		reducefiles = append(reducefiles, enc)
+		defer file.Close()
+	}
+	//创建json
 
-	// send the RPC request, wait for the reply.
-	// the "Coordinator.Example" tells the
-	// receiving server that we'd like to call
-	// the Example() method of struct Coordinator.
-	ok := call("Coordinator.Example", &args, &reply)
-	if ok {
-		// reply.Y should be 100.
-		fmt.Printf("reply.Y %v\n", reply.Y)
-	} else {
-		fmt.Printf("call failed!\n")
+	for _, kv := range kva {
+		partition := ihash(kv.Key) % nReduce
+		err := reducefiles[partition].Encode(&kv)
+		if err != nil {
+			log.Fatalf("cannot encode json %v", err)
+			call_done(id, RPC_SEND_ERROR)
+		}
+	}
+	//填入json
+
+	call_done(id, RPC_SEND_DONE_MAP)
+
+}
+
+func do_reduce(id int, nMap int, reducef func(string, []string) string) {
+	var kva []KeyValue
+	h := &MinHeap{}
+	heap.Init(h)
+	var reducefiles []*json.Decoder
+	for i := 0; i < nMap; i++ {
+		jsonname := fmt.Sprintf("mr-%v-%v", i, id)
+		file, err := os.Open(jsonname)
+		if err != nil {
+			log.Fatalf("cannot open file %v", jsonname)
+			call_done(id, RPC_SEND_ERROR)
+		}
+		dec := json.NewDecoder(file)
+		reducefiles = append(reducefiles, dec)
+
+		//初始化堆
+		var kv KeyValue
+		_ = dec.Decode(&kv)
+		heap.Push(h, Merge{
+			kv:    kv,
+			index: i,
+		})
+
+		defer file.Close()
+	}
+
+	for h.Len() > 0 {
+		merge := h.Pop().(Merge)
+		kva = append(kva, merge.kv)
+
+		var kv KeyValue
+		err := reducefiles[merge.index].Decode(&kv)
+		if err != nil { //已读完
+		} else {
+			heap.Push(h, Merge{
+				kv:    kv,
+				index: merge.index,
+			})
+		}
+	}
+
+	oname := fmt.Sprintf("mr-out-%v", id)
+	ofile, _ := os.Create(oname)
+
+	i := 0
+	for i < len(kva) {
+		j := i + 1
+		for j < len(kva) && kva[j].Key == kva[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, kva[k].Value)
+		}
+		output := reducef(kva[i].Key, values)
+
+		// this is the correct format for each line of Reduce indexeroutput.
+		fmt.Fprintf(ofile, "%v %v\n", kva[i].Key, output)
+
+		i = j
+	}
+
+	ofile.Close()
+
+	call_done(id, RPC_SEND_DONE_REDUCE)
+}
+
+func call_done(id int, _type int) {
+	args := ArgsType{ID: id, Send_type: _type}
+	reply := ReplyType{}
+	ok := call("Coordinator.Handle", args, &reply)
+	if !ok {
+		log.Fatalf("rpc send error")
 	}
 }
 
-//
 // send an RPC request to the coordinator, wait for the response.
 // usually returns true.
 // returns false if something goes wrong.
-//
 func call(rpcname string, args interface{}, reply interface{}) bool {
 	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
 	sockname := coordinatorSock()
