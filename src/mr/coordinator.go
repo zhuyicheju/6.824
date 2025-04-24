@@ -2,7 +2,6 @@ package mr
 
 import (
 	"container/heap"
-	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -24,7 +23,7 @@ func (h *map_heap) Less(i int, j int) bool {
 	if (*h)[i].timestamp == (*h)[j].timestamp {
 		return (*h)[i].task_id < (*h)[j].task_id
 	}
-	return (*h)[i].timestamp > (*h)[j].timestamp
+	return (*h)[i].timestamp < (*h)[j].timestamp
 }
 func (h *map_heap) Swap(i int, j int) { (*h)[i], (*h)[j] = (*h)[j], (*h)[i] }
 func (h *map_heap) Push(x interface{}) {
@@ -247,7 +246,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 
 	c.server()
 
-	fmt.Println("Coordinator Running...")
-	fmt.Printf("MapFiles: %v nReduce: %v\n", len(files), nReduce)
+	// fmt.Println("Coordinator Running...")
+	// fmt.Printf("MapFiles: %v nReduce: %v\n", len(files), nReduce)
 	return &c
 }

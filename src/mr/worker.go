@@ -68,9 +68,9 @@ func Worker(mapf func(string, string) []KeyValue,
 		if ok {
 			switch reply.Reply_type {
 			case RPC_REPLY_REDUCE:
-				go do_reduce(reply.ID, reply.NMap, reducef)
+				do_reduce(reply.ID, reply.NMap, reducef)
 			case RPC_REPLY_MAP:
-				go do_map(reply.ID, reply.File, reply.NReduce, mapf)
+				do_map(reply.ID, reply.File, reply.NReduce, mapf)
 			case RPC_REPLY_DONE:
 				is_done = true
 			case RPC_REPLY_WAIT:
@@ -210,6 +210,7 @@ func do_reduce(id int, nMap int, reducef func(string, []string) string) {
 }
 
 func call_done(id int, _type int) {
+	// fmt.Printf("done %v %v\n", id, os.Getpid())
 	args := ArgsType{ID: id, Send_type: _type}
 	reply := ReplyType{}
 	ok := call("Coordinator.Handle", args, &reply)
