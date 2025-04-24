@@ -201,7 +201,7 @@ func RequestReduce(c *Coordinator, args *ArgsType, reply *ReplyType) {
 
 		case STATUS_WORKING:
 			reply.Reply_type = RPC_REPLY_WAIT
-			heap.Push(&c.map_heap, tasknode{task.task_id, task.timestamp})
+			heap.Push(&c.reduce_heap, tasknode{task.task_id, task.timestamp})
 		}
 	}
 }
@@ -223,6 +223,8 @@ func (c *Coordinator) server() {
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
 func (c *Coordinator) Done() bool {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
 	return c.reduce_is_done
 }
 

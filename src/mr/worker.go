@@ -87,6 +87,7 @@ func Worker(mapf func(string, string) []KeyValue,
 }
 
 func do_map(id int, filename string, nReduce int, mapf func(string, string) []KeyValue) {
+	// fmt.Printf("map %v %v\n", id, os.Getpid())
 	file, err := os.Open(filename)
 	if err != nil {
 		log.Fatalf("cannot open %v", filename)
@@ -122,7 +123,6 @@ func do_map(id int, filename string, nReduce int, mapf func(string, string) []Ke
 
 	for _, kv := range kva {
 		partition := ihash(kv.Key) % nReduce
-
 		err := reducefiles[partition].Encode(&kv)
 		if err != nil {
 			log.Fatalf("cannot encode json %v", err)
@@ -184,7 +184,8 @@ func do_reduce(id int, nMap int, reducef func(string, []string) string) {
 	}
 
 	oname := fmt.Sprintf("mr-out-%v", id)
-	ofile, _ := os.Create(oname)
+	ofile, _ := os.CreateTemp("", oname)
+	defer ofile.Close()
 
 	i := 0
 	for i < len(kva) {
@@ -204,8 +205,7 @@ func do_reduce(id int, nMap int, reducef func(string, []string) string) {
 		i = j
 	}
 
-	ofile.Close()
-
+	os.Rename(ofile.Name(), oname)
 	call_done(id, RPC_SEND_DONE_REDUCE)
 }
 
