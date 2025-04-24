@@ -8,6 +8,7 @@ import (
 	"net/rpc"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -53,33 +54,28 @@ type Coordinator struct {
 	nMap    int
 	mutex   sync.Mutex
 
-	reduce_is_done  bool
-	reduce_done_num int
-	reduce_heap     map_heap
-	reduce_status   []int
+	reduce_is_done     bool
+	reduce_done_num    int32
+	reduce_heap        map_heap
+	reduce_heap_lock   sync.Mutex
+	reduce_status      []int
+	reduce_status_lock []sync.Mutex
 
-	map_is_done  bool
-	map_done_num int
-	map_heap     map_heap
-	map_status   []int
+	map_is_done     bool
+	map_done_num    int32
+	map_heap        map_heap
+	map_heap_lock   sync.Mutex
+	map_status      []int
+	map_status_lock []sync.Mutex
 }
 
 const MS2S = 1000
 
-// Your code here -- RPC handlers for the worker to call.
-
-// an example RPC handler.
-//
-// the RPC argument and reply types are defined in rpc.go.
-// func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
-// 	reply.Y = args.X + 1
-// 	return nil
-// }
-
 func (c *Coordinator) Handle(args ArgsType, reply *ReplyType) error {
-	c.mutex.Lock()
-	defer c.mutex.Unlock()
+	// c.mutex.Lock()
+	// defer c.mutex.Unlock()
 
+	//不需要锁，done只会从0变到1
 	if c.reduce_is_done {
 		reply.Reply_type = RPC_REPLY_DONE
 		return nil
@@ -106,24 +102,29 @@ func (c *Coordinator) Handle(args ArgsType, reply *ReplyType) error {
 func DoneMap(c *Coordinator, args *ArgsType, reply *ReplyType) {
 	// fmt.Printf("DoneMap %v\n", args.ID)
 	id := args.ID
+	c.map_status_lock[id].Lock()
 	if c.map_status[id] != STATUS_DONE {
-		c.map_done_num++
+		atomic.AddInt32(&c.map_done_num, 1)
 		c.map_status[id] = STATUS_DONE
-		if c.map_done_num == c.nMap {
+		if c.map_done_num == int32(c.nMap) {
 			c.map_is_done = true
 		}
 	}
+	c.map_status_lock[id].Unlock()
 }
 func DoneReduce(c *Coordinator, args *ArgsType, reply *ReplyType) {
 	// fmt.Printf("DoneReduce %v\n", args.ID)
 	id := args.ID
+
+	c.reduce_status_lock[id].Lock()
 	if c.reduce_status[id] != STATUS_DONE {
-		c.reduce_done_num++
+		atomic.AddInt32(&c.reduce_done_num, 1)
 		c.reduce_status[id] = STATUS_DONE
-		if c.reduce_done_num == c.nReduce {
+		if c.reduce_done_num == int32(c.nReduce) {
 			c.reduce_is_done = true
 		}
 	}
+	c.reduce_status_lock[id].Unlock()
 }
 func RequestMap(c *Coordinator, args *ArgsType, reply *ReplyType) {
 	reply.Reply_type = RPC_REPLY_MAP
@@ -132,15 +133,19 @@ func RequestMap(c *Coordinator, args *ArgsType, reply *ReplyType) {
 
 	restart := true
 	for restart {
+		c.map_heap_lock.Lock()
 		if c.map_heap.Len() == 0 {
 			reply.Reply_type = RPC_REPLY_WAIT
+			c.map_heap_lock.Unlock()
 			return
 		}
 		task := heap.Pop(&c.map_heap).(tasknode)
+		c.map_heap_lock.Unlock()
+
+		c.map_status_lock[task.task_id].Lock()
 		if c.map_status[task.task_id] == STATUS_WORKING && time.Now().UnixMilli()-task.timestamp > 10*MS2S {
 			c.map_status[task.task_id] = STATUS_TIMEOUT
 		}
-		// fmt.Printf("taskid %v %v\n", task.task_id, c.map_status[task.task_id])
 		stat := c.map_status[task.task_id]
 		switch stat {
 		case STATUS_DONE:
@@ -155,14 +160,18 @@ func RequestMap(c *Coordinator, args *ArgsType, reply *ReplyType) {
 			reply.File = c.files[task.task_id]
 
 			c.map_status[task.task_id] = STATUS_WORKING
+			c.map_heap_lock.Lock()
 			heap.Push(&c.map_heap, tasknode{task.task_id, time.Now().UnixMilli()})
-			// fmt.Printf("MapTask %v\n", reply.ID)
+			c.map_heap_lock.Unlock()
 
 		case STATUS_WORKING:
 			restart = false
 			reply.Reply_type = RPC_REPLY_WAIT
+			c.map_heap_lock.Lock()
 			heap.Push(&c.map_heap, tasknode{task.task_id, task.timestamp})
+			c.map_heap_lock.Unlock()
 		}
+		c.map_status_lock[task.task_id].Unlock()
 	}
 }
 
@@ -174,11 +183,16 @@ func RequestReduce(c *Coordinator, args *ArgsType, reply *ReplyType) {
 	restart := true
 	for restart {
 		restart = false
+		c.reduce_heap_lock.Lock()
 		if c.reduce_heap.Len() == 0 {
 			reply.Reply_type = RPC_REPLY_DONE
+			c.reduce_heap_lock.Unlock()
 			break
 		}
 		task := heap.Pop(&c.reduce_heap).(tasknode)
+		c.reduce_heap_lock.Unlock()
+
+		c.reduce_status_lock[task.task_id].Lock()
 		if c.reduce_status[task.task_id] == STATUS_WORKING && time.Now().UnixMilli()-task.timestamp > 5*MS2S {
 			c.reduce_status[task.task_id] = STATUS_TIMEOUT
 		}
@@ -195,13 +209,17 @@ func RequestReduce(c *Coordinator, args *ArgsType, reply *ReplyType) {
 			reply.ID = task.task_id
 
 			c.reduce_status[task.task_id] = STATUS_WORKING
+			c.reduce_heap_lock.Lock()
 			heap.Push(&c.reduce_heap, tasknode{task.task_id, time.Now().UnixMilli()})
-			// fmt.Printf("ReduceTask %v\n", reply.ID)
+			c.reduce_heap_lock.Unlock()
 
 		case STATUS_WORKING:
 			reply.Reply_type = RPC_REPLY_WAIT
+			c.reduce_heap_lock.Lock()
 			heap.Push(&c.reduce_heap, tasknode{task.task_id, task.timestamp})
+			c.reduce_heap_lock.Unlock()
 		}
+		c.reduce_status_lock[task.task_id].Unlock()
 	}
 }
 
@@ -236,12 +254,14 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	for i := 0; i < c.nMap; i++ {
 		heap.Push(&c.map_heap, tasknode{task_id: i, timestamp: 0})
 		c.map_status = append(c.map_status, STATUS_PENDING)
+		c.map_status_lock = append(c.map_status_lock, sync.Mutex{})
 	}
 
 	heap.Init(&c.reduce_heap)
 	for i := 0; i < c.nReduce; i++ {
 		heap.Push(&c.reduce_heap, tasknode{task_id: i, timestamp: 0})
 		c.reduce_status = append(c.reduce_status, STATUS_PENDING)
+		c.reduce_status_lock = append(c.reduce_status_lock, sync.Mutex{})
 	}
 
 	c.server()
