@@ -59,7 +59,7 @@ func ihash(key string) int {
 // main/mrworker.go calls this function.
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
-	fmt.Println("Worker running...")
+	// fmt.Println("Worker running...")
 	args := ArgsType{Send_type: RPC_SEND_REQUEST}
 	is_done := false
 	for {
@@ -102,23 +102,27 @@ func do_map(id int, filename string, nReduce int, mapf func(string, string) []Ke
 	kva := mapf(filename, string(content))
 	sort.Sort(ByKey(kva))
 
+	var files []*os.File
 	var reducefiles []*json.Encoder
 
 	for i := 0; i < nReduce; i++ {
 		jsonname := fmt.Sprintf("mr-%v-%v", id, i)
-		file, err := os.Create(jsonname)
+		file, err := os.CreateTemp("", jsonname)
 		if err != nil {
 			log.Fatalf("cannot create file %v", jsonname)
 			call_done(id, RPC_SEND_ERROR)
 		}
 		enc := json.NewEncoder(file)
+		files = append(files, file)
 		reducefiles = append(reducefiles, enc)
 		defer file.Close()
 	}
+
 	//创建json
 
 	for _, kv := range kva {
 		partition := ihash(kv.Key) % nReduce
+
 		err := reducefiles[partition].Encode(&kv)
 		if err != nil {
 			log.Fatalf("cannot encode json %v", err)
@@ -126,6 +130,11 @@ func do_map(id int, filename string, nReduce int, mapf func(string, string) []Ke
 		}
 	}
 	//填入json
+
+	for i, file := range files {
+		jsonname := fmt.Sprintf("mr-%v-%v", id, i)
+		os.Rename(file.Name(), jsonname)
+	}
 
 	call_done(id, RPC_SEND_DONE_MAP)
 
@@ -160,13 +169,13 @@ func do_reduce(id int, nMap int, reducef func(string, []string) string) {
 	}
 
 	for h.Len() > 0 {
-		merge := h.Pop().(Merge)
+		// merge := h.Pop().(Merge)
+		merge := heap.Pop(h).(Merge)
 		kva = append(kva, merge.kv)
 
 		var kv KeyValue
 		err := reducefiles[merge.index].Decode(&kv)
 		if err != io.EOF { //已读完
-		} else {
 			heap.Push(h, Merge{
 				kv:    kv,
 				index: merge.index,

@@ -138,7 +138,7 @@ func RequestMap(c *Coordinator, args *ArgsType, reply *ReplyType) {
 			return
 		}
 		task := heap.Pop(&c.map_heap).(tasknode)
-		if c.map_status[task.task_id] == STATUS_WORKING && time.Now().UnixMilli()-task.timestamp > 5*MS2S && false {
+		if c.map_status[task.task_id] == STATUS_WORKING && time.Now().UnixMilli()-task.timestamp > 10*MS2S {
 			c.map_status[task.task_id] = STATUS_TIMEOUT
 		}
 		// fmt.Printf("taskid %v %v\n", task.task_id, c.map_status[task.task_id])
@@ -180,7 +180,7 @@ func RequestReduce(c *Coordinator, args *ArgsType, reply *ReplyType) {
 			break
 		}
 		task := heap.Pop(&c.reduce_heap).(tasknode)
-		if c.reduce_status[task.task_id] == STATUS_WORKING && time.Now().UnixMilli()-task.timestamp > 5*MS2S && false {
+		if c.reduce_status[task.task_id] == STATUS_WORKING && time.Now().UnixMilli()-task.timestamp > 5*MS2S {
 			c.reduce_status[task.task_id] = STATUS_TIMEOUT
 		}
 		stat := c.reduce_status[task.task_id]
