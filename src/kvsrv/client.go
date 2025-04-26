@@ -1,13 +1,17 @@
 package kvsrv
 
-import "6.5840/labrpc"
-import "crypto/rand"
-import "math/big"
+import (
+	"crypto/rand"
+	"fmt"
+	"math/big"
 
+	"6.5840/labrpc"
+)
 
 type Clerk struct {
-	server *labrpc.ClientEnd
-	// You will have to modify this struct.
+	server     *labrpc.ClientEnd
+	client_id  int64
+	request_id uint32
 }
 
 func nrand() int64 {
@@ -20,7 +24,8 @@ func nrand() int64 {
 func MakeClerk(server *labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.server = server
-	// You'll have to add code here.
+	ck.client_id = nrand()
+	ck.request_id = 0
 	return ck
 }
 
@@ -35,9 +40,24 @@ func MakeClerk(server *labrpc.ClientEnd) *Clerk {
 // must match the declared types of the RPC handler function's
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) Get(key string) string {
+	ck.request_id++
+	args := GetArgs{Key: key, Term: ck.request_id, Client_id: ck.client_id}
+	reply := GetReply{}
+	ok := false
+	for !ok {
+		reply = GetReply{}
+		ok = ck.server.Call("KVServer.Get", &args, &reply)
+		if ok {
+			report_ok := false
+			report_args := Report{Client_id: ck.client_id}
+			report_reply := GetReply{}
+			for !report_ok {
+				report_ok = ck.server.Call("KVServer.Report", &report_args, &report_reply)
+			}
+		}
+	}
 
-	// You will have to modify this function.
-	return ""
+	return reply.Value
 }
 
 // shared by Put and Append.
@@ -49,8 +69,23 @@ func (ck *Clerk) Get(key string) string {
 // must match the declared types of the RPC handler function's
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) PutAppend(key string, value string, op string) string {
-	// You will have to modify this function.
-	return ""
+	ck.request_id++
+	args := PutAppendArgs{Key: key, Value: value, Term: ck.request_id, Client_id: ck.client_id}
+	reply := PutAppendReply{}
+	ok := false
+	for !ok {
+		reply = PutAppendReply{}
+		ok = ck.server.Call(fmt.Sprintf("KVServer.%v", op), &args, &reply)
+		if ok {
+			report_ok := false
+			report_args := Report{Client_id: ck.client_id}
+			report_reply := GetReply{}
+			for !report_ok {
+				report_ok = ck.server.Call("KVServer.Report", &report_args, &report_reply)
+			}
+		}
+	}
+	return reply.Value
 }
 
 func (ck *Clerk) Put(key string, value string) {
