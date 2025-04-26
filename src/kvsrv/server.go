@@ -19,7 +19,7 @@ type KVServer struct {
 
 	kv map[string]string
 
-	client map[int64]uint32
+	// client map[int64]uint32
 
 	oldvalue map[int64]string
 }
@@ -31,24 +31,24 @@ type KVServer struct {
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	if args.Term <= kv.client[args.Client_id] {
-		reply.Value = kv.oldvalue[args.Client_id]
+	val, ok := kv.oldvalue[args.Message_id]
+	if ok {
+		reply.Value = val
 		return
 	}
-	kv.client[args.Client_id]++
 	key := args.Key
-	kv.oldvalue[args.Client_id] = kv.kv[key]
+	kv.oldvalue[args.Message_id] = kv.kv[key]
 	reply.Value = kv.kv[key]
 }
 
 func (kv *KVServer) Put(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	if args.Term <= kv.client[args.Client_id] {
+	_, ok := kv.oldvalue[args.Message_id]
+	if ok {
 		reply.Value = ""
 		return
 	}
-	kv.client[args.Client_id]++
 	key := args.Key
 	value := args.Value
 	reply.Value = ""
@@ -58,15 +58,15 @@ func (kv *KVServer) Put(args *PutAppendArgs, reply *PutAppendReply) {
 func (kv *KVServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	if args.Term <= kv.client[args.Client_id] {
-		reply.Value = kv.oldvalue[args.Client_id]
+	val, ok := kv.oldvalue[args.Message_id]
+	if ok {
+		reply.Value = val
 		return
 	}
-	kv.client[args.Client_id]++
 	key := args.Key
 	value := args.Value
 	oldvalue := kv.kv[key]
-	kv.oldvalue[args.Client_id] = oldvalue
+	kv.oldvalue[args.Message_id] = oldvalue
 	reply.Value = oldvalue
 	kv.kv[key] = oldvalue + value
 }
@@ -74,15 +74,13 @@ func (kv *KVServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
 func (kv *KVServer) Report(args *Report, reply *GetReply) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	delete(kv.oldvalue, args.Client_id)
+	delete(kv.oldvalue, args.Message_id)
 }
 
 func StartKVServer() *KVServer {
 	kv := new(KVServer)
 
 	kv.kv = make(map[string]string)
-
-	kv.client = make(map[int64]uint32)
 
 	kv.oldvalue = make(map[int64]string)
 

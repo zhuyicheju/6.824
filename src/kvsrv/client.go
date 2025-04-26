@@ -9,9 +9,7 @@ import (
 )
 
 type Clerk struct {
-	server     *labrpc.ClientEnd
-	client_id  int64
-	request_id uint32
+	server *labrpc.ClientEnd
 }
 
 func nrand() int64 {
@@ -24,8 +22,6 @@ func nrand() int64 {
 func MakeClerk(server *labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.server = server
-	ck.client_id = nrand()
-	ck.request_id = 0
 	return ck
 }
 
@@ -40,23 +36,21 @@ func MakeClerk(server *labrpc.ClientEnd) *Clerk {
 // must match the declared types of the RPC handler function's
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) Get(key string) string {
-	ck.request_id++
-	args := GetArgs{Key: key, Term: ck.request_id, Client_id: ck.client_id}
+	id := nrand()
+	args := GetArgs{Key: key, Message_id: id}
 	reply := GetReply{}
 	ok := false
 	for !ok {
 		reply = GetReply{}
 		ok = ck.server.Call("KVServer.Get", &args, &reply)
-		if ok {
-			report_ok := false
-			report_args := Report{Client_id: ck.client_id}
-			report_reply := GetReply{}
-			for !report_ok {
-				report_ok = ck.server.Call("KVServer.Report", &report_args, &report_reply)
-			}
-		}
 	}
 
+	report_ok := false
+	report_args := Report{Message_id: id}
+	report_reply := GetReply{}
+	for !report_ok {
+		report_ok = ck.server.Call("KVServer.Report", &report_args, &report_reply)
+	}
 	return reply.Value
 }
 
@@ -69,21 +63,20 @@ func (ck *Clerk) Get(key string) string {
 // must match the declared types of the RPC handler function's
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) PutAppend(key string, value string, op string) string {
-	ck.request_id++
-	args := PutAppendArgs{Key: key, Value: value, Term: ck.request_id, Client_id: ck.client_id}
+	id := nrand()
+	args := PutAppendArgs{Key: key, Value: value, Message_id: id}
 	reply := PutAppendReply{}
 	ok := false
 	for !ok {
 		reply = PutAppendReply{}
 		ok = ck.server.Call(fmt.Sprintf("KVServer.%v", op), &args, &reply)
-		if ok {
-			report_ok := false
-			report_args := Report{Client_id: ck.client_id}
-			report_reply := GetReply{}
-			for !report_ok {
-				report_ok = ck.server.Call("KVServer.Report", &report_args, &report_reply)
-			}
-		}
+	}
+
+	report_ok := false
+	report_args := Report{Message_id: id}
+	report_reply := GetReply{}
+	for !report_ok {
+		report_ok = ck.server.Call("KVServer.Report", &report_args, &report_reply)
 	}
 	return reply.Value
 }
