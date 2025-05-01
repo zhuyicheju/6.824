@@ -49,6 +49,17 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
+type LogEntry struct {
+	term int
+	log  interface{}
+}
+
+const (
+	FOLLOWER = iota
+	CANDIDATE
+	LEADER
+)
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -60,13 +71,48 @@ type Raft struct {
 	currentTerm int
 	votedFor    int
 
-	log interface{} // need to be implented
+	log []LogEntry // need to be implented
 
 	commitIndex int
 	lastApplied int
 
 	nextIndex  []int
 	matchIndex []int
+
+	//自己添加
+
+	heartbeat_timestamp int64
+
+	state int
+}
+
+type RequestVoteArgs struct {
+	Term         int
+	CandidatedId int
+	LastLogIndex int
+	LastLogTerm  int
+}
+
+type RequestVoteReply struct {
+	Term        int
+	VoteGranted bool
+}
+
+type AppendEntriesArgs struct {
+	Term     int
+	LeaderId int
+
+	PrevLogIndex int
+	PrevLogTerm  int
+
+	Entries []LogEntry
+
+	LeaderCommit int
+}
+
+type AppendEntriesReply struct {
+	term    int
+	success bool
 }
 
 // return currentTerm and whether this server
@@ -126,52 +172,12 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
-type RequestVoteArgs struct {
-	Term         int
-	CandidatedId int
-	LastLogIndex int
-	LastLogTerm  int
-}
+func (rf *Raft) AppendEntries(args *RequestVoteArgs, reply *RequestVoteReply) {
 
-type RequestVoteReply struct {
-	Term        int
-	VoteGranted bool
 }
 
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (3A, 3B).
-}
 
-// example code to send a RequestVote RPC to a server.
-// server is the index of the target server in rf.peers[].
-// expects RPC arguments in args.
-// fills in *reply with RPC reply, so caller should
-// pass &reply.
-// the types of the args and reply passed to Call() must be
-// the same as the types of the arguments declared in the
-// handler function (including whether they are pointers).
-//
-// The labrpc package simulates a lossy network, in which servers
-// may be unreachable, and in which requests and replies may be lost.
-// Call() sends a request and waits for a reply. If a reply arrives
-// within a timeout interval, Call() returns true; otherwise
-// Call() returns false. Thus Call() may not return for a while.
-// A false return can be caused by a dead server, a live server that
-// can't be reached, a lost request, or a lost reply.
-//
-// Call() is guaranteed to return (perhaps after a delay) *except* if the
-// handler function on the server side does not return.  Thus there
-// is no need to implement your own timeouts around Call().
-//
-// look at the comments in ../labrpc/labrpc.go for more details.
-//
-// if you're having trouble getting RPC to work, check that you've
-// capitalized all field names in structs passed over RPC, and
-// that the caller passes the address of the reply struct with &, not
-// the struct itself.
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	return ok
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -196,35 +202,119 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	return index, term, isLeader
 }
 
-// the tester doesn't halt goroutines created by Raft after each test,
-// but it does call the Kill() method. your code can use killed() to
-// check whether Kill() has been called. the use of atomic avoids the
-// need for a lock.
-//
-// the issue is that long-running goroutines use memory and may chew
-// up CPU time, perhaps causing later tests to fail and generating
-// confusing debug output. any goroutine with a long-running loop
-// should call killed() to check whether it should stop.
-func (rf *Raft) Kill() {
-	atomic.StoreInt32(&rf.dead, 1)
-	// Your code here, if desired.
+func Leader(rf *Raft) {
+	rf.state = LEADER
+	peers_num := len(rf.peers)
+	for {
+		args := AppendEntriesArgs{Term: rf.currentTerm, LeaderId: rf.me,
+			PrevLogIndex: len(rf.log) - 1, PrevLogTerm: rf.log[len(rf.log)-1].term,
+			LeaderCommit: rf.commitIndex}
+
+		replyCh := make(chan *AppendEntriesReply, peers_num-1)
+
+		for i := 0; i < peers_num; i++ {
+			if i == rf.me {
+				continue
+			}
+
+			go func(server int) {
+				reply := AppendEntriesReply{}
+				ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+				if ok {
+					replyCh <- &reply
+				} else {
+					replyCh <- nil
+				}
+			}(i)
+		}
+
+		ms := 50 + (rand.Int63() % 300)
+		time.Sleep(time.Duration(ms) * time.Millisecond) //选举超时时间
+
+		close(replyCh)
+
+		for i := 0; i < peers_num-1; i++ {
+			reply, ok := <-replyCh
+			if ok && reply != nil {
+				if rf.currentTerm < reply.term {
+					rf.currentTerm = reply.term
+					rf.state = FOLLOWER
+					return
+				}
+
+				if !reply.success {
+					//目标server log过低
+				}
+			}
+		}
+	}
 }
 
-func (rf *Raft) killed() bool {
-	z := atomic.LoadInt32(&rf.dead)
-	return z == 1
+func Candidate(rf *Raft) {
+	rf.state = CANDIDATE
+	peers_num := len(rf.peers)
+	for {
+		granted_cnt := 1
+		rf.currentTerm++
+		args := RequestVoteArgs{Term: rf.currentTerm, CandidatedId: rf.me,
+			LastLogIndex: len(rf.log) - 1, LastLogTerm: rf.log[len(rf.log)-1].term}
+
+		replyCh := make(chan *RequestVoteReply, peers_num-1)
+
+		for i := 0; i < peers_num; i++ {
+			if i == rf.me {
+				continue
+			}
+
+			go func(server int) {
+				reply := RequestVoteReply{}
+				ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+				if ok {
+					replyCh <- &reply
+				} else {
+					replyCh <- nil
+				}
+			}(i)
+		}
+
+		ms := 50 + (rand.Int63() % 300)
+		time.Sleep(time.Duration(ms) * time.Millisecond) //选举超时时间
+
+		close(replyCh)
+
+		for i := 0; i < peers_num-1; i++ {
+			reply, ok := <-replyCh
+			if ok && reply != nil {
+				if reply.VoteGranted {
+					granted_cnt++
+					if granted_cnt >= (peers_num+1)/2 {
+						Leader(rf)
+						rf.state = FOLLOWER
+						return //若是leader被打为follower直接return到tick
+					}
+				} else {
+					rf.currentTerm = reply.Term
+					rf.state = FOLLOWER
+					return //降为follower
+				}
+			}
+		}
+
+	}
 }
 
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
-
-		// Your code here (3A)
-		// Check if a leader election should be started.
-
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
 		ms := 50 + (rand.Int63() % 300)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
+
+		if time.Now().Sub(time.Unix(rf.heartbeat_timestamp, 0)).Milliseconds() > ms {
+			//超时
+			//自下向上转换不需要手动添加状态转换
+			Candidate(rf)
+		}
 	}
 }
 
@@ -244,7 +334,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 
-	// Your initialization code here (3A, 3B, 3C).
+	rf.log = make([]LogEntry, 0, 0)
+
+	rf.currentTerm = 0
+	rf.votedFor = -1
+	rf.heartbeat_timestamp = 0
+	rf.state = FOLLOWER
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -253,4 +348,23 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.ticker()
 
 	return rf
+}
+
+// the tester doesn't halt goroutines created by Raft after each test,
+// but it does call the Kill() method. your code can use killed() to
+// check whether Kill() has been called. the use of atomic avoids the
+// need for a lock.
+//
+// the issue is that long-running goroutines use memory and may chew
+// up CPU time, perhaps causing later tests to fail and generating
+// confusing debug output. any goroutine with a long-running loop
+// should call killed() to check whether it should stop.
+func (rf *Raft) Kill() {
+	atomic.StoreInt32(&rf.dead, 1)
+	// Your code here, if desired.
+}
+
+func (rf *Raft) killed() bool {
+	z := atomic.LoadInt32(&rf.dead)
+	return z == 1
 }
