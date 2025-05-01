@@ -15,13 +15,13 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 }
 
 type KVServer struct {
-	mu sync.Mutex
-
-	kv map[string]string
+	kv    map[string]string
+	mu_kv sync.Mutex
 
 	// client map[int64]uint32
 
-	oldvalue map[int64]string
+	oldvalue    map[int64]string
+	mu_oldvalue sync.Mutex
 }
 
 //	发送 结束
@@ -29,22 +29,32 @@ type KVServer struct {
 // client 1   1
 // server 0   1
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-	val, ok := kv.oldvalue[args.Message_id]
+	id := args.Message_id
+	kv.mu_oldvalue.Lock()
+	val, ok := kv.oldvalue[id]
+	kv.mu_oldvalue.Unlock()
 	if ok {
 		reply.Value = val
 		return
 	}
 	key := args.Key
-	kv.oldvalue[args.Message_id] = kv.kv[key]
-	reply.Value = kv.kv[key]
+
+	kv.mu_kv.Lock()
+	value := kv.kv[key]
+	kv.mu_kv.Unlock()
+
+	kv.mu_oldvalue.Lock()
+	kv.oldvalue[id] = value
+	kv.mu_oldvalue.Unlock()
+
+	reply.Value = value
 }
 
 func (kv *KVServer) Put(args *PutAppendArgs, reply *PutAppendReply) {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-	_, ok := kv.oldvalue[args.Message_id]
+	id := args.Message_id
+	kv.mu_oldvalue.Lock()
+	_, ok := kv.oldvalue[id]
+	kv.mu_oldvalue.Unlock()
 	if ok {
 		reply.Value = ""
 		return
@@ -52,29 +62,44 @@ func (kv *KVServer) Put(args *PutAppendArgs, reply *PutAppendReply) {
 	key := args.Key
 	value := args.Value
 	reply.Value = ""
+
+	kv.mu_kv.Lock()
 	kv.kv[key] = value
+	kv.mu_kv.Unlock()
+
+	kv.mu_oldvalue.Lock()
+	kv.oldvalue[id] = ""
+	kv.mu_oldvalue.Unlock()
 }
 
 func (kv *KVServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-	val, ok := kv.oldvalue[args.Message_id]
+	id := args.Message_id
+	kv.mu_oldvalue.Lock()
+	val, ok := kv.oldvalue[id]
+	kv.mu_oldvalue.Unlock()
 	if ok {
 		reply.Value = val
 		return
 	}
 	key := args.Key
 	value := args.Value
+
+	kv.mu_kv.Lock()
 	oldvalue := kv.kv[key]
-	kv.oldvalue[args.Message_id] = oldvalue
-	reply.Value = oldvalue
 	kv.kv[key] = oldvalue + value
+	kv.mu_kv.Unlock()
+
+	reply.Value = oldvalue
+
+	kv.mu_oldvalue.Lock()
+	kv.oldvalue[id] = oldvalue
+	kv.mu_oldvalue.Unlock()
 }
 
 func (kv *KVServer) Report(args *Report, reply *GetReply) {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
+	kv.mu_oldvalue.Lock()
 	delete(kv.oldvalue, args.Message_id)
+	kv.mu_oldvalue.Unlock()
 }
 
 func StartKVServer() *KVServer {
