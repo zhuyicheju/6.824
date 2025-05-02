@@ -111,8 +111,8 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	term    int
-	success bool
+	Term    int
+	Success bool
 }
 
 // return currentTerm and whether this server
@@ -172,12 +172,33 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
-func (rf *Raft) AppendEntries(args *RequestVoteArgs, reply *RequestVoteReply) {
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	reply.Term = rf.currentTerm
+	if args.Term < rf.currentTerm ||
+		args.PrevLogTerm < rf.log[len(rf.log)-1].term ||
+		args.PrevLogIndex < len(rf.log)-1 {
+		reply.Success = false
+		reply.Term = rf.currentTerm
+		return
+	}
 
+	rf.heartbeat_timestamp = time.Now().UnixMilli()
+	reply.Term = rf.currentTerm
+	rf.currentTerm = args.Term
+	reply.Success = true
 }
 
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+	reply.Term = rf.currentTerm
+	if args.Term < rf.currentTerm || rf.votedFor != -1 ||
+		args.LastLogTerm < rf.log[len(rf.log)-1].term || args.LastLogIndex < len(rf.log)-1 {
+		reply.VoteGranted = false
+		return
+	}
 
+	rf.currentTerm = args.Term
+	rf.votedFor = args.CandidatedId
+	reply.VoteGranted = true
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -236,13 +257,13 @@ func Leader(rf *Raft) {
 		for i := 0; i < peers_num-1; i++ {
 			reply, ok := <-replyCh
 			if ok && reply != nil {
-				if rf.currentTerm < reply.term {
-					rf.currentTerm = reply.term
+				if rf.currentTerm < reply.Term {
+					rf.currentTerm = reply.Term
 					rf.state = FOLLOWER
 					return
 				}
 
-				if !reply.success {
+				if !reply.Success {
 					//目标server log过低
 				}
 			}
