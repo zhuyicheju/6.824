@@ -176,43 +176,37 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.mu.Unlock()
 	currentTerm := rf.currentTerm
 	reply.Term = currentTerm
-	if args.Term < currentTerm && rf.state == LEADER {
-		reply.Success = false
-		reply.Term = currentTerm
-		return
-	}
+
 	if args.Term < currentTerm ||
 		args.PrevLogTerm < rf.log[len(rf.log)-1].Term ||
 		args.PrevLogIndex < len(rf.log)-1 {
 		reply.Success = false
-		reply.Term = currentTerm
 		return
 	}
 
+	reply.Success = true
 	rf.heartbeat_timestamp = time.Now().UnixMilli()
-	reply.Term = currentTerm
 	rf.currentTerm = args.Term
 	rf.state = FOLLOWER
-	reply.Success = true
 }
 
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
 	currentTerm := atomic.LoadInt32(&rf.currentTerm)
 	reply.Term = currentTerm
 	if args.Term < currentTerm || rf.votedFor != -1 ||
 		args.LastLogTerm < rf.log[len(rf.log)-1].Term || args.LastLogIndex < len(rf.log)-1 {
-		reply.Term = currentTerm
 		reply.VoteGranted = false
 		return
 	}
 
+	rf.votedFor = args.CandidatedId
+	reply.VoteGranted = true
 	rf.heartbeat_timestamp = time.Now().UnixMilli()
 	rf.currentTerm = args.Term
-	rf.votedFor = args.CandidatedId
 	rf.state = FOLLOWER
-	reply.VoteGranted = true
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -242,11 +236,6 @@ func Leader(rf *Raft) {
 	rf.state = LEADER
 	peers_num := len(rf.peers)
 	for {
-		if rf.state == FOLLOWER {
-			//因接到更高term的rpc
-			//持有锁退出
-			return
-		}
 
 		args := AppendEntriesArgs{Term: rf.currentTerm, LeaderId: rf.me,
 			PrevLogIndex: len(rf.log) - 1, PrevLogTerm: rf.log[len(rf.log)-1].Term,
@@ -293,6 +282,12 @@ func Leader(rf *Raft) {
 
 		rf.mu.Lock()
 
+		if rf.state == FOLLOWER {
+			//因接到更高term的rpc
+			//持有锁退出
+			return
+		}
+
 		for i := 0; i < peers_num-1; i++ {
 			reply, ok := <-replyCh
 			if ok && reply != nil {
@@ -317,10 +312,6 @@ func Candidate(rf *Raft) {
 	rf.state = CANDIDATE
 	peers_num := len(rf.peers)
 	for {
-		if rf.state == FOLLOWER {
-			//因接到更高term的rpc
-			return
-		}
 		granted_cnt := 1
 		rf.currentTerm++
 		rf.votedFor = rf.me
@@ -357,6 +348,7 @@ func Candidate(rf *Raft) {
 		}
 
 		rf.mu.Unlock()
+
 		ms := 300 + (rand.Int63() % 200)
 		time.Sleep(time.Duration(ms) * time.Millisecond) //选举超时时间
 
@@ -367,18 +359,23 @@ func Candidate(rf *Raft) {
 
 		rf.mu.Lock()
 
+		if rf.state == FOLLOWER {
+			//因接到更高term的rpc
+			return
+		}
+
 		for i := 0; i < peers_num-1; i++ {
 			reply, ok := <-replyCh
 			if ok && reply != nil {
 				if reply.VoteGranted {
 					granted_cnt++
-					if granted_cnt >= (peers_num+1)/2 {
+					if granted_cnt >= (peers_num)/2+1 {
 						Leader(rf)
-						rf.state = FOLLOWER
 						return //若是leader被打为follower直接return到tick
 					}
 				} else {
-					//还有对方任期小，但已投过
+					//还有对方任期小，但已投过, 情况
+
 					if reply.Term > rf.currentTerm {
 						//对方任期大
 						rf.currentTerm = reply.Term
