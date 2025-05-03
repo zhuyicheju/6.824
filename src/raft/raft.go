@@ -19,6 +19,7 @@ package raft
 
 import (
 	//	"bytes"
+
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -118,11 +119,9 @@ type AppendEntriesReply struct {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
-	// Your code here (3A).
-	return term, isleader
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return int(rf.currentTerm), rf.state == LEADER
 }
 
 // save Raft's persistent state to stable storage,
@@ -252,6 +251,8 @@ func Leader(rf *Raft) {
 			PrevLogIndex: len(rf.log) - 1, PrevLogTerm: rf.log[len(rf.log)-1].Term,
 			LeaderCommit: rf.commitIndex}
 
+		var rw sync.RWMutex
+		done := false
 		replyCh := make(chan *AppendEntriesReply, peers_num-1)
 
 		for i := 0; i < peers_num; i++ {
@@ -262,11 +263,19 @@ func Leader(rf *Raft) {
 			go func(server int) {
 				reply := AppendEntriesReply{}
 				ok := rf.peers[server].Call("Raft.AppendEntries", &args, &reply)
+
+				var msg *AppendEntriesReply
 				if ok {
-					replyCh <- &reply
+					msg = &reply
 				} else {
-					replyCh <- nil
+					msg = nil
 				}
+
+				rw.RLock()
+				if !done {
+					replyCh <- msg
+				}
+				rw.RUnlock()
 			}(i)
 		}
 
@@ -275,7 +284,11 @@ func Leader(rf *Raft) {
 		ms := 100
 		//每秒<=10次beat
 		time.Sleep(time.Duration(ms) * time.Millisecond) //选举超时时间
+
+		rw.Lock()
+		done = true
 		close(replyCh)
+		rw.Unlock()
 
 		rf.mu.Lock()
 
@@ -313,6 +326,8 @@ func Candidate(rf *Raft) {
 		args := RequestVoteArgs{Term: rf.currentTerm, CandidatedId: rf.me,
 			LastLogIndex: len(rf.log) - 1, LastLogTerm: rf.log[len(rf.log)-1].Term}
 
+		var rw sync.RWMutex
+		done := false
 		replyCh := make(chan *RequestVoteReply, peers_num-1)
 
 		for i := 0; i < peers_num; i++ {
@@ -323,11 +338,20 @@ func Candidate(rf *Raft) {
 			go func(server int) {
 				reply := RequestVoteReply{}
 				ok := rf.peers[server].Call("Raft.RequestVote", &args, &reply)
+
+				var msg *RequestVoteReply
 				if ok {
-					replyCh <- &reply
+					msg = &reply
 				} else {
-					replyCh <- nil
+					msg = nil
 				}
+
+				rw.RLock()
+				if !done {
+					replyCh <- msg
+				}
+				rw.RUnlock()
+
 			}(i)
 		}
 
@@ -335,7 +359,10 @@ func Candidate(rf *Raft) {
 		ms := 450 + (rand.Int63() % 150)
 		time.Sleep(time.Duration(ms) * time.Millisecond) //选举超时时间
 
+		rw.Lock()
+		done = true
 		close(replyCh)
+		rw.Unlock()
 
 		rf.mu.Lock()
 
