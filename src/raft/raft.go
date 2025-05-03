@@ -50,7 +50,7 @@ type ApplyMsg struct {
 }
 
 type LogEntry struct {
-	term int
+	term int32
 	log  interface{}
 }
 
@@ -68,7 +68,7 @@ type Raft struct {
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
 
-	currentTerm int
+	currentTerm int32
 	votedFor    int
 
 	log []LogEntry // need to be implented
@@ -83,27 +83,27 @@ type Raft struct {
 
 	heartbeat_timestamp int64
 
-	state int
+	state int32
 }
 
 type RequestVoteArgs struct {
-	Term         int
+	Term         int32
 	CandidatedId int
 	LastLogIndex int
-	LastLogTerm  int
+	LastLogTerm  int32
 }
 
 type RequestVoteReply struct {
-	Term        int
+	Term        int32
 	VoteGranted bool
 }
 
 type AppendEntriesArgs struct {
-	Term     int
+	Term     int32
 	LeaderId int
 
 	PrevLogIndex int
-	PrevLogTerm  int
+	PrevLogTerm  int32
 
 	Entries []LogEntry
 
@@ -111,7 +111,7 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int
+	Term    int32
 	Success bool
 }
 
@@ -173,24 +173,31 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	reply.Term = rf.currentTerm
-	if args.Term < rf.currentTerm ||
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	currentTerm := atomic.LoadInt32(&rf.currentTerm)
+	reply.Term = currentTerm
+	if args.Term < currentTerm ||
 		args.PrevLogTerm < rf.log[len(rf.log)-1].term ||
 		args.PrevLogIndex < len(rf.log)-1 {
 		reply.Success = false
-		reply.Term = rf.currentTerm
+		reply.Term = currentTerm
 		return
 	}
 
-	rf.heartbeat_timestamp = time.Now().UnixMilli()
-	reply.Term = rf.currentTerm
-	rf.currentTerm = args.Term
+	atomic.StoreInt64(&rf.heartbeat_timestamp, time.Now().UnixMilli())
+	reply.Term = currentTerm
+	atomic.StoreInt32(&rf.currentTerm, args.Term)
+	atomic.StoreInt32(&rf.state, FOLLOWER)
 	reply.Success = true
 }
 
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	reply.Term = rf.currentTerm
-	if args.Term < rf.currentTerm || rf.votedFor != -1 ||
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	currentTerm := atomic.LoadInt32(&rf.currentTerm)
+	reply.Term = currentTerm
+	if args.Term < currentTerm || rf.votedFor != -1 ||
 		args.LastLogTerm < rf.log[len(rf.log)-1].term || args.LastLogIndex < len(rf.log)-1 {
 		reply.VoteGranted = false
 		return
@@ -198,6 +205,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	rf.currentTerm = args.Term
 	rf.votedFor = args.CandidatedId
+	rf.state = FOLLOWER
 	reply.VoteGranted = true
 }
 
@@ -224,9 +232,16 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 }
 
 func Leader(rf *Raft) {
+	//进入时持有锁
 	rf.state = LEADER
 	peers_num := len(rf.peers)
 	for {
+		if rf.state == FOLLOWER {
+			//因接到更高term的rpc
+			//持有锁退出
+			return
+		}
+
 		args := AppendEntriesArgs{Term: rf.currentTerm, LeaderId: rf.me,
 			PrevLogIndex: len(rf.log) - 1, PrevLogTerm: rf.log[len(rf.log)-1].term,
 			LeaderCommit: rf.commitIndex}
@@ -249,9 +264,12 @@ func Leader(rf *Raft) {
 			}(i)
 		}
 
-		ms := 50 + (rand.Int63() % 300)
+		rf.mu.Unlock()
+		ms := 100
+		//每秒<=10次beat
 		time.Sleep(time.Duration(ms) * time.Millisecond) //选举超时时间
 
+		rf.mu.Lock()
 		close(replyCh)
 
 		for i := 0; i < peers_num-1; i++ {
@@ -260,6 +278,7 @@ func Leader(rf *Raft) {
 				if rf.currentTerm < reply.Term {
 					rf.currentTerm = reply.Term
 					rf.state = FOLLOWER
+					//持有锁退出
 					return
 				}
 
@@ -272,9 +291,14 @@ func Leader(rf *Raft) {
 }
 
 func Candidate(rf *Raft) {
+	//进入时持有锁
 	rf.state = CANDIDATE
 	peers_num := len(rf.peers)
 	for {
+		if rf.state == FOLLOWER {
+			//因接到更高term的rpc
+			return
+		}
 		granted_cnt := 1
 		rf.currentTerm++
 		args := RequestVoteArgs{Term: rf.currentTerm, CandidatedId: rf.me,
@@ -298,9 +322,11 @@ func Candidate(rf *Raft) {
 			}(i)
 		}
 
-		ms := 50 + (rand.Int63() % 300)
+		rf.mu.Unlock()
+		ms := 450 + (rand.Int63() % 150)
 		time.Sleep(time.Duration(ms) * time.Millisecond) //选举超时时间
 
+		rf.mu.Lock()
 		close(replyCh)
 
 		for i := 0; i < peers_num-1; i++ {
@@ -328,14 +354,16 @@ func (rf *Raft) ticker() {
 	for rf.killed() == false {
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
-		ms := 50 + (rand.Int63() % 300)
+		ms := 450 + (rand.Int63() % 150)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 
+		rf.mu.Lock()
 		if time.Now().Sub(time.Unix(rf.heartbeat_timestamp, 0)).Milliseconds() > ms {
 			//超时
 			//自下向上转换不需要手动添加状态转换
 			Candidate(rf)
 		}
+		rf.mu.Unlock()
 	}
 }
 
