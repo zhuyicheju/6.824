@@ -208,6 +208,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
+	rf.heartbeat_timestamp = time.Now().UnixMilli()
 	rf.currentTerm = args.Term
 	rf.votedFor = args.CandidatedId
 	rf.state = FOLLOWER
@@ -356,7 +357,7 @@ func Candidate(rf *Raft) {
 		}
 
 		rf.mu.Unlock()
-		ms := 450 + (rand.Int63() % 150)
+		ms := 300 + (rand.Int63() % 200)
 		time.Sleep(time.Duration(ms) * time.Millisecond) //选举超时时间
 
 		rw.Lock()
@@ -377,10 +378,14 @@ func Candidate(rf *Raft) {
 						return //若是leader被打为follower直接return到tick
 					}
 				} else {
-					rf.currentTerm = reply.Term
-					rf.state = FOLLOWER
-					rf.votedFor = -1
-					return //降为follower
+					//还有对方任期小，但已投过
+					if reply.Term > rf.currentTerm {
+						//对方任期大
+						rf.currentTerm = reply.Term
+						rf.state = FOLLOWER
+						rf.votedFor = -1
+						return //降为follower
+					}
 				}
 			}
 		}
@@ -392,11 +397,11 @@ func (rf *Raft) ticker() {
 	for rf.killed() == false {
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
-		ms := 450 + (rand.Int63() % 150)
+		ms := 300 + (rand.Int63() % 200)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 
 		rf.mu.Lock()
-		if int64(time.Since(time.UnixMilli(ms))) > ms {
+		if int64(time.Since(time.UnixMilli(rf.heartbeat_timestamp))) > ms {
 			//超时
 			//自下向上转换不需要手动添加状态转换
 			Candidate(rf)
