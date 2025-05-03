@@ -50,8 +50,8 @@ type ApplyMsg struct {
 }
 
 type LogEntry struct {
-	term int32
-	log  interface{}
+	Term int32
+	Log  interface{}
 }
 
 const (
@@ -175,20 +175,25 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	currentTerm := atomic.LoadInt32(&rf.currentTerm)
+	currentTerm := rf.currentTerm
 	reply.Term = currentTerm
+	if args.Term < currentTerm && rf.state == LEADER {
+		reply.Success = false
+		reply.Term = currentTerm
+		return
+	}
 	if args.Term < currentTerm ||
-		args.PrevLogTerm < rf.log[len(rf.log)-1].term ||
+		args.PrevLogTerm < rf.log[len(rf.log)-1].Term ||
 		args.PrevLogIndex < len(rf.log)-1 {
 		reply.Success = false
 		reply.Term = currentTerm
 		return
 	}
 
-	atomic.StoreInt64(&rf.heartbeat_timestamp, time.Now().UnixMilli())
+	rf.heartbeat_timestamp = time.Now().UnixMilli()
 	reply.Term = currentTerm
-	atomic.StoreInt32(&rf.currentTerm, args.Term)
-	atomic.StoreInt32(&rf.state, FOLLOWER)
+	rf.currentTerm = args.Term
+	rf.state = FOLLOWER
 	reply.Success = true
 }
 
@@ -198,7 +203,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	currentTerm := atomic.LoadInt32(&rf.currentTerm)
 	reply.Term = currentTerm
 	if args.Term < currentTerm || rf.votedFor != -1 ||
-		args.LastLogTerm < rf.log[len(rf.log)-1].term || args.LastLogIndex < len(rf.log)-1 {
+		args.LastLogTerm < rf.log[len(rf.log)-1].Term || args.LastLogIndex < len(rf.log)-1 {
+		reply.Term = currentTerm
 		reply.VoteGranted = false
 		return
 	}
@@ -243,7 +249,7 @@ func Leader(rf *Raft) {
 		}
 
 		args := AppendEntriesArgs{Term: rf.currentTerm, LeaderId: rf.me,
-			PrevLogIndex: len(rf.log) - 1, PrevLogTerm: rf.log[len(rf.log)-1].term,
+			PrevLogIndex: len(rf.log) - 1, PrevLogTerm: rf.log[len(rf.log)-1].Term,
 			LeaderCommit: rf.commitIndex}
 
 		replyCh := make(chan *AppendEntriesReply, peers_num-1)
@@ -255,7 +261,7 @@ func Leader(rf *Raft) {
 
 			go func(server int) {
 				reply := AppendEntriesReply{}
-				ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+				ok := rf.peers[server].Call("Raft.AppendEntries", &args, &reply)
 				if ok {
 					replyCh <- &reply
 				} else {
@@ -265,12 +271,13 @@ func Leader(rf *Raft) {
 		}
 
 		rf.mu.Unlock()
+
 		ms := 100
 		//每秒<=10次beat
 		time.Sleep(time.Duration(ms) * time.Millisecond) //选举超时时间
+		close(replyCh)
 
 		rf.mu.Lock()
-		close(replyCh)
 
 		for i := 0; i < peers_num-1; i++ {
 			reply, ok := <-replyCh
@@ -278,6 +285,7 @@ func Leader(rf *Raft) {
 				if rf.currentTerm < reply.Term {
 					rf.currentTerm = reply.Term
 					rf.state = FOLLOWER
+					rf.votedFor = -1
 					//持有锁退出
 					return
 				}
@@ -301,8 +309,9 @@ func Candidate(rf *Raft) {
 		}
 		granted_cnt := 1
 		rf.currentTerm++
+		rf.votedFor = rf.me
 		args := RequestVoteArgs{Term: rf.currentTerm, CandidatedId: rf.me,
-			LastLogIndex: len(rf.log) - 1, LastLogTerm: rf.log[len(rf.log)-1].term}
+			LastLogIndex: len(rf.log) - 1, LastLogTerm: rf.log[len(rf.log)-1].Term}
 
 		replyCh := make(chan *RequestVoteReply, peers_num-1)
 
@@ -313,7 +322,7 @@ func Candidate(rf *Raft) {
 
 			go func(server int) {
 				reply := RequestVoteReply{}
-				ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+				ok := rf.peers[server].Call("Raft.RequestVote", &args, &reply)
 				if ok {
 					replyCh <- &reply
 				} else {
@@ -326,8 +335,9 @@ func Candidate(rf *Raft) {
 		ms := 450 + (rand.Int63() % 150)
 		time.Sleep(time.Duration(ms) * time.Millisecond) //选举超时时间
 
-		rf.mu.Lock()
 		close(replyCh)
+
+		rf.mu.Lock()
 
 		for i := 0; i < peers_num-1; i++ {
 			reply, ok := <-replyCh
@@ -342,6 +352,7 @@ func Candidate(rf *Raft) {
 				} else {
 					rf.currentTerm = reply.Term
 					rf.state = FOLLOWER
+					rf.votedFor = -1
 					return //降为follower
 				}
 			}
@@ -358,7 +369,7 @@ func (rf *Raft) ticker() {
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 
 		rf.mu.Lock()
-		if time.Now().Sub(time.Unix(rf.heartbeat_timestamp, 0)).Milliseconds() > ms {
+		if int64(time.Since(time.UnixMilli(ms))) > ms {
 			//超时
 			//自下向上转换不需要手动添加状态转换
 			Candidate(rf)
@@ -383,7 +394,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 
-	rf.log = make([]LogEntry, 0, 0)
+	rf.log = make([]LogEntry, 1, 1)
+	rf.log[0] = LogEntry{Term: -1}
 
 	rf.currentTerm = 0
 	rf.votedFor = -1
