@@ -20,7 +20,6 @@ package raft
 import (
 	//	"bytes"
 
-	"log"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -177,7 +176,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	defer log.Printf("Serve %v: AppendEntries %v %v %v %v\n", rf.me, args.LeaderId, args.Term, rf.currentTerm, reply.Success)
+	//defer log.Printf("Serve %v: AppendEntries %v %v %v %v\n", rf.me, args.LeaderId, args.Term, rf.currentTerm, reply.Success)
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -222,7 +221,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.heartbeat_timestamp = time.Now().UnixMilli()
 	rf.currentTerm = args.Term
 	rf.state = FOLLOWER
-	log.Printf("Serve %v: RequestVote %v %v %v %v %v\n", rf.me, args.CandidatedId, args.Term, rf.currentTerm, reply.VoteGranted, rf.votedFor)
+	//log.Printf("Serve %v: RequestVote %v %v %v %v %v\n", rf.me, args.CandidatedId, args.Term, rf.currentTerm, reply.VoteGranted, rf.votedFor)
 
 }
 
@@ -387,7 +386,7 @@ func Candidate(rf *Raft) {
 				if reply.VoteGranted {
 					granted_cnt++
 					if granted_cnt >= (peers_num)/2+1 {
-						log.Printf("Server %v: 选举成功，进入leader\n", rf.me)
+						//log.Printf("Server %v: 选举成功，进入leader\n", rf.me)
 						Leader(rf)
 						return //若是leader被打为follower直接return到tick
 					}
@@ -417,7 +416,7 @@ func (rf *Raft) ticker() {
 
 		rf.mu.Lock()
 		if time.Since(time.UnixMilli(rf.heartbeat_timestamp)).Milliseconds() > ms {
-			log.Printf("Serve %v: 等待超时，开始选举\n", rf.me)
+			//log.Printf("Serve %v: 等待超时，开始选举\n", rf.me)
 			//超时
 			//自下向上转换不需要手动添加状态转换
 			Candidate(rf)
