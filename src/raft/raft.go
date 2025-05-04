@@ -20,6 +20,7 @@ package raft
 import (
 	//	"bytes"
 
+	"log"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -172,14 +173,21 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	if rf.killed() {
+		return
+	}
+
+	defer log.Printf("Serve %v: AppendEntries %v %v %v %v\n", rf.me, args.LeaderId, args.Term, rf.currentTerm, reply.Success)
+
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	currentTerm := rf.currentTerm
 	reply.Term = currentTerm
 
-	if args.Term < currentTerm ||
-		args.PrevLogTerm < rf.log[len(rf.log)-1].Term ||
-		args.PrevLogIndex < len(rf.log)-1 {
+	if args.Term < currentTerm {
+		// args.PrevLogTerm < rf.log[len(rf.log)-1].Term ||
+		// args.PrevLogIndex < len(rf.log)-1 {
+
 		reply.Success = false
 		return
 	}
@@ -191,13 +199,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 }
 
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+
+	if rf.killed() {
+		return
+	}
+
 	rf.mu.Lock()
+
 	defer rf.mu.Unlock()
 
-	currentTerm := atomic.LoadInt32(&rf.currentTerm)
+	currentTerm := rf.currentTerm
 	reply.Term = currentTerm
-	if args.Term < currentTerm || rf.votedFor != -1 ||
-		args.LastLogTerm < rf.log[len(rf.log)-1].Term || args.LastLogIndex < len(rf.log)-1 {
+	if args.Term < currentTerm || rf.votedFor != -1 {
+		// args.LastLogTerm < rf.log[len(rf.log)-1].Term ||
+		// args.LastLogIndex < len(rf.log)-1 {
 		reply.VoteGranted = false
 		return
 	}
@@ -207,6 +222,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.heartbeat_timestamp = time.Now().UnixMilli()
 	rf.currentTerm = args.Term
 	rf.state = FOLLOWER
+	log.Printf("Serve %v: RequestVote %v %v %v %v %v\n", rf.me, args.CandidatedId, args.Term, rf.currentTerm, reply.VoteGranted, rf.votedFor)
+
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -235,7 +252,7 @@ func Leader(rf *Raft) {
 	//进入时持有锁
 	rf.state = LEADER
 	peers_num := len(rf.peers)
-	for {
+	for rf.killed() == false {
 
 		args := AppendEntriesArgs{Term: rf.currentTerm, LeaderId: rf.me,
 			PrevLogIndex: len(rf.log) - 1, PrevLogTerm: rf.log[len(rf.log)-1].Term,
@@ -311,7 +328,7 @@ func Candidate(rf *Raft) {
 	//进入时持有锁
 	rf.state = CANDIDATE
 	peers_num := len(rf.peers)
-	for {
+	for rf.killed() == false {
 		granted_cnt := 1
 		rf.currentTerm++
 		rf.votedFor = rf.me
@@ -370,6 +387,7 @@ func Candidate(rf *Raft) {
 				if reply.VoteGranted {
 					granted_cnt++
 					if granted_cnt >= (peers_num)/2+1 {
+						log.Printf("Server %v: 选举成功，进入leader\n", rf.me)
 						Leader(rf)
 						return //若是leader被打为follower直接return到tick
 					}
@@ -398,7 +416,8 @@ func (rf *Raft) ticker() {
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 
 		rf.mu.Lock()
-		if int64(time.Since(time.UnixMilli(rf.heartbeat_timestamp))) > ms {
+		if time.Since(time.UnixMilli(rf.heartbeat_timestamp)).Milliseconds() > ms {
+			log.Printf("Serve %v: 等待超时，开始选举\n", rf.me)
 			//超时
 			//自下向上转换不需要手动添加状态转换
 			Candidate(rf)
@@ -423,12 +442,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 
-	rf.log = make([]LogEntry, 1, 1)
+	rf.log = make([]LogEntry, 1)
 	rf.log[0] = LogEntry{Term: -1}
 
 	rf.currentTerm = 0
 	rf.votedFor = -1
-	rf.heartbeat_timestamp = 0
+	rf.heartbeat_timestamp = time.Now().UnixMilli()
 	rf.state = FOLLOWER
 
 	// initialize from state persisted before a crash
