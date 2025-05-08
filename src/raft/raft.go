@@ -21,6 +21,7 @@ import (
 	//	"bytes"
 
 	"container/heap"
+	"log"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -144,15 +145,15 @@ func (mt *MedianTracker) Add(index, newVal int) {
 }
 
 func NewMedianTracker(arr []int) *MedianTracker {
-	low := &MaxHeap{}
-	high := &MinHeap{}
-	heap.Init(low)
-	heap.Init(high)
+	low := make(MaxHeap, len(arr)+1/2)
+	high := make(MinHeap, len(arr)+1/2)
+	heap.Init(&low)
+	heap.Init(&high)
 
 	// 初始将数组的元素加入堆
 	mt := &MedianTracker{
-		low:      low,
-		high:     high,
+		low:      &low,
+		high:     &high,
 		arr:      arr,
 		arrIndex: make(map[int]int),
 	}
@@ -248,7 +249,7 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	me         int
+	Me         int
 	Term       int32
 	Success    bool
 	Append_num int
@@ -318,12 +319,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.mu.Unlock()
 	currentTerm := rf.currentTerm
 	reply.Term = currentTerm
-	reply.me = rf.me
+	reply.Me = rf.me
 
 	if args.Term < currentTerm {
 		//任期过低
 		reply.Success = false
-		// log.printf("Serve %v: AppendEntries %v %v %v %v\n", rf.me, args.LeaderId, args.Term, rf.currentTerm, reply.Success)
 		return
 	}
 
@@ -334,6 +334,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.log = rf.log[:len(rf.log)-1]
 		}
 		reply.Success = false
+		return
 	}
 
 	rf.commitIndex = args.LeaderCommit
@@ -343,7 +344,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.heartbeat_timestamp = time.Now().UnixMilli()
 	rf.currentTerm = args.Term
 	rf.state = FOLLOWER
-	// log.printf("Serve %v: AppendEntries %v %v %v %v\n", rf.me, args.LeaderId, args.Term, rf.currentTerm, reply.Success)
+	log.Printf("Serve %v: AppendEntries log %v commit %v\n", rf.me, len(rf.log)-1, rf.commitIndex)
 
 }
 
@@ -398,6 +399,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	if isLeader {
 		rf.log = append(rf.log, LogEntry{Term: rf.currentTerm, Log: command})
+		log.Printf("Server %v: Start 是否leader %v, Term %v, Index %v\n", rf.me, rf.state == LEADER, rf.currentTerm, len(rf.log))
 	}
 
 	return index, term, isLeader
@@ -411,7 +413,7 @@ func Leader(rf *Raft) {
 
 	for i := range rf.matchIndex {
 		//初始化每个数组的匹配日志
-		rf.matchIndex[i] = 0
+		rf.matchIndex[i] = -1
 		rf.nextIndex[i] = len(rf.log)
 	}
 
@@ -425,15 +427,13 @@ func Leader(rf *Raft) {
 				continue
 			}
 
-			// log.printf("Server %v: 向%v发送心跳\n", rf.me, i)
-
 			//func是按引用捕获
 			go func(server int) {
-				entries := make([]LogEntry, 0, 0)
-				if rf.matchIndex[server] != 0 && len(rf.log)-1 >= rf.nextIndex[server] {
+				entries := make([]LogEntry, 0)
+				if rf.matchIndex[server] != -1 && len(rf.log)-1 >= rf.nextIndex[server] {
 					entries = append(entries, rf.log[rf.nextIndex[server]:]...)
-					// log.printf("Server %v: 向%v发送心跳\n", rf.me, i)
 				}
+				log.Printf("Server %v: 向%v发送心跳 prev %v\n", rf.me, server, rf.nextIndex[server]-1)
 				args := AppendEntriesArgs{Term: rf.currentTerm, LeaderId: rf.me,
 					PrevLogIndex: rf.nextIndex[server] - 1, PrevLogTerm: rf.log[rf.nextIndex[server]-1].Term,
 					LeaderCommit: rf.commitIndex,
@@ -498,12 +498,12 @@ func Leader(rf *Raft) {
 					//日志冲突&日志太短
 
 					//寻找leader和follower一致日志
-					rf.nextIndex[reply.me]--
+					rf.nextIndex[reply.Me]--
 				} else {
 					//正常成功
-					rf.nextIndex[reply.me] += reply.Append_num
-					rf.matchIndex[reply.me] = rf.nextIndex[reply.me] - 1
-					rf.median_tracker.Add(reply.me, rf.matchIndex[reply.me])
+					rf.nextIndex[reply.Me] += reply.Append_num
+					rf.matchIndex[reply.Me] = rf.nextIndex[reply.Me] - 1
+					rf.median_tracker.Add(reply.Me, rf.matchIndex[reply.Me])
 					median := rf.median_tracker.GetMedian()
 					if rf.log[median].Term == rf.currentTerm {
 						rf.commitIndex = median
@@ -635,7 +635,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	rf.log = make([]LogEntry, 1)
-	rf.log[0] = LogEntry{Term: -1}
+	rf.log[0] = LogEntry{Term: 0}
 
 	rf.median_tracker = NewMedianTracker(make([]int, len(rf.peers)))
 
