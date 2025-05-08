@@ -20,6 +20,7 @@ package raft
 import (
 	//	"bytes"
 
+	"container/heap"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -28,6 +29,139 @@ import (
 	//	"6.5840/labgob"
 	"6.5840/labrpc"
 )
+
+type MaxHeap []int
+
+func (h MaxHeap) Len() int           { return len(h) }
+func (h MaxHeap) Less(i, j int) bool { return h[i] > h[j] } // 注意：我们要使得堆顶最大
+func (h MaxHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+
+func (h *MaxHeap) Push(x interface{}) {
+	*h = append(*h, x.(int))
+}
+
+func (h *MaxHeap) Pop() interface{} {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[0 : n-1]
+	return x
+}
+
+// 最小堆（高堆）
+type MinHeap []int
+
+func (h MinHeap) Len() int           { return len(h) }
+func (h MinHeap) Less(i, j int) bool { return h[i] < h[j] } // 默认堆顶最小
+func (h MinHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+
+func (h *MinHeap) Push(x interface{}) {
+	*h = append(*h, x.(int))
+}
+
+func (h *MinHeap) Pop() interface{} {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[0 : n-1]
+	return x
+}
+
+type MedianTracker struct {
+	low      *MaxHeap    // 最大堆（小的一半）
+	high     *MinHeap    // 最小堆（大的一半）
+	arr      []int       // 存储原始的数组
+	arrIndex map[int]int // 记录每个索引的元素值
+}
+
+// 从堆中删除元素
+func (mt *MedianTracker) removeFromHeap(value int) {
+	// 移除元素时需要重新构建堆
+	tempHeap := []int{}
+	// 选择移除 `low` 还是 `high` 堆中的元素
+	if value <= (*mt.low)[0] {
+		// 在 low 堆中
+		for mt.low.Len() > 0 && (*mt.low)[0] != value {
+			tempHeap = append(tempHeap, heap.Pop(mt.low).(int))
+		}
+		heap.Pop(mt.low)
+	} else {
+		// 在 high 堆中
+		for mt.high.Len() > 0 && (*mt.high)[0] != value {
+			tempHeap = append(tempHeap, heap.Pop(mt.high).(int))
+		}
+		heap.Pop(mt.high)
+	}
+	// 恢复堆的状态
+	for _, num := range tempHeap {
+		mt.insertIntoHeap(num)
+	}
+}
+
+// 将一个新值插入到正确的堆中
+func (mt *MedianTracker) insertIntoHeap(value int) {
+	if mt.low.Len() == 0 || value <= (*mt.low)[0] {
+		heap.Push(mt.low, value)
+	} else {
+		heap.Push(mt.high, value)
+	}
+}
+
+// 保持堆的平衡
+func (mt *MedianTracker) balanceHeaps() {
+	if mt.low.Len() > mt.high.Len()+1 {
+		// low 堆比 high 堆多一个元素，移一个元素到 high 堆
+		heap.Push(mt.high, heap.Pop(mt.low))
+	} else if mt.high.Len() > mt.low.Len() {
+		// high 堆比 low 堆多一个元素，移一个元素到 low 堆
+		heap.Push(mt.low, heap.Pop(mt.high))
+	}
+}
+
+// GetMedian 获取当前的中位数
+func (mt *MedianTracker) GetMedian() int {
+	if mt.low.Len() > mt.high.Len() {
+		return (*mt.low)[0]
+	}
+	// 当两个堆的大小相等时，返回两个堆顶的平均值
+	return (*mt.high)[0]
+}
+
+// Add 更新数组中索引为 index 的元素，并保持堆的平衡
+func (mt *MedianTracker) Add(index, newVal int) {
+	// 获取旧值
+	oldVal := mt.arrIndex[index]
+	mt.arrIndex[index] = newVal
+
+	// 删除旧值
+	mt.removeFromHeap(oldVal)
+
+	// 插入新值
+	mt.insertIntoHeap(newVal)
+
+	// 保持堆的平衡
+	mt.balanceHeaps()
+}
+
+func NewMedianTracker(arr []int) *MedianTracker {
+	low := &MaxHeap{}
+	high := &MinHeap{}
+	heap.Init(low)
+	heap.Init(high)
+
+	// 初始将数组的元素加入堆
+	mt := &MedianTracker{
+		low:      low,
+		high:     high,
+		arr:      arr,
+		arrIndex: make(map[int]int),
+	}
+	for i, num := range arr {
+		mt.arrIndex[i] = num
+		mt.Add(i, num) // 初始化时也将数组的元素加入堆
+	}
+	return mt
+}
 
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
@@ -85,6 +219,8 @@ type Raft struct {
 	heartbeat_timestamp int64
 
 	state int32
+
+	median_tracker *MedianTracker
 }
 
 type RequestVoteArgs struct {
@@ -112,8 +248,10 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int32
-	Success bool
+	me         int
+	Term       int32
+	Success    bool
+	Append_num int
 }
 
 // return currentTerm and whether this server
@@ -180,17 +318,27 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.mu.Unlock()
 	currentTerm := rf.currentTerm
 	reply.Term = currentTerm
+	reply.me = rf.me
 
 	if args.Term < currentTerm {
-		// args.PrevLogTerm < rf.log[len(rf.log)-1].Term ||
-		// args.PrevLogIndex < len(rf.log)-1 {
-
+		//任期过低
 		reply.Success = false
 		// log.printf("Serve %v: AppendEntries %v %v %v %v\n", rf.me, args.LeaderId, args.Term, rf.currentTerm, reply.Success)
-
 		return
 	}
 
+	if args.PrevLogTerm != rf.log[len(rf.log)-1].Term ||
+		args.PrevLogIndex != len(rf.log)-1 {
+		//日志不匹配
+		if len(rf.log) != 1 {
+			rf.log = rf.log[:len(rf.log)-1]
+		}
+		reply.Success = false
+	}
+
+	rf.commitIndex = args.LeaderCommit
+	rf.log = append(rf.log, args.Entries...)
+	reply.Append_num = len(args.Entries)
 	reply.Success = true
 	rf.heartbeat_timestamp = time.Now().UnixMilli()
 	rf.currentTerm = args.Term
@@ -241,11 +389,16 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
-	// Your code here (3B).
+	index := len(rf.log)
+	term := int(rf.currentTerm)
+	isLeader := (rf.state == LEADER)
+
+	if isLeader {
+		rf.log = append(rf.log, LogEntry{Term: rf.currentTerm, Log: command})
+	}
 
 	return index, term, isLeader
 }
@@ -254,12 +407,15 @@ func Leader(rf *Raft) {
 	//进入时持有锁
 	rf.state = LEADER
 	peers_num := len(rf.peers)
+	rf.median_tracker.Add(rf.me, len(rf.log))
+
+	for i := range rf.matchIndex {
+		//初始化每个数组的匹配日志
+		rf.matchIndex[i] = 0
+		rf.nextIndex[i] = len(rf.log)
+	}
+
 	for rf.killed() == false {
-
-		args := AppendEntriesArgs{Term: rf.currentTerm, LeaderId: rf.me,
-			PrevLogIndex: len(rf.log) - 1, PrevLogTerm: rf.log[len(rf.log)-1].Term,
-			LeaderCommit: rf.commitIndex}
-
 		var rw sync.RWMutex
 		done := false
 		replyCh := make(chan *AppendEntriesReply, peers_num-1)
@@ -270,7 +426,18 @@ func Leader(rf *Raft) {
 			}
 
 			// log.printf("Server %v: 向%v发送心跳\n", rf.me, i)
+
+			//func是按引用捕获
 			go func(server int) {
+				entries := make([]LogEntry, 0, 0)
+				if rf.matchIndex[server] != 0 && len(rf.log)-1 >= rf.nextIndex[server] {
+					entries = append(entries, rf.log[rf.nextIndex[server]:]...)
+					// log.printf("Server %v: 向%v发送心跳\n", rf.me, i)
+				}
+				args := AppendEntriesArgs{Term: rf.currentTerm, LeaderId: rf.me,
+					PrevLogIndex: rf.nextIndex[server] - 1, PrevLogTerm: rf.log[rf.nextIndex[server]-1].Term,
+					LeaderCommit: rf.commitIndex,
+					Entries:      entries}
 				reply := AppendEntriesReply{}
 				ok := rf.peers[server].Call("Raft.AppendEntries", &args, &reply)
 
@@ -311,7 +478,15 @@ func Leader(rf *Raft) {
 		for i := 0; i < peers_num-1; i++ {
 			reply, ok := <-replyCh
 			if ok && reply != nil {
+
+				//reply类型 success term
+				//正常成功   true    ==
+				//任期过期   false   >
+				//日志冲突   false   ==  term相同，日志不一致，prevLogIndex 或 prevLogTerm 处与 leader 不匹配。
+				//日志太短   false   ==  leader 给出的 prevLogIndex 超过了跟随者日志的末尾。
+
 				if rf.currentTerm < reply.Term {
+					//任期过期
 					rf.currentTerm = reply.Term
 					rf.state = FOLLOWER
 					rf.votedFor = -1
@@ -320,7 +495,20 @@ func Leader(rf *Raft) {
 				}
 
 				if !reply.Success {
-					//目标server log过低
+					//日志冲突&日志太短
+
+					//寻找leader和follower一致日志
+					rf.nextIndex[reply.me]--
+				} else {
+					//正常成功
+					rf.nextIndex[reply.me] += reply.Append_num
+					rf.matchIndex[reply.me] = rf.nextIndex[reply.me] - 1
+					rf.median_tracker.Add(reply.me, rf.matchIndex[reply.me])
+					median := rf.median_tracker.GetMedian()
+					if rf.log[median].Term == rf.currentTerm {
+						rf.commitIndex = median
+					}
+					//更新matchindex
 				}
 			}
 		}
@@ -449,10 +637,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.log = make([]LogEntry, 1)
 	rf.log[0] = LogEntry{Term: -1}
 
+	rf.median_tracker = NewMedianTracker(make([]int, len(rf.peers)))
+
 	rf.currentTerm = 0
 	rf.votedFor = -1
 	rf.heartbeat_timestamp = time.Now().UnixMilli()
 	rf.state = FOLLOWER
+
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
