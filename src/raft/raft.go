@@ -203,6 +203,7 @@ type Raft struct {
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
+	applyCh   chan ApplyMsg
 
 	currentTerm int32
 	votedFor    int
@@ -337,7 +338,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	rf.commitIndex = args.LeaderCommit
+	if args.LeaderCommit > rf.commitIndex {
+		if rf.commitIndex == 0 {
+			rf.commitIndex++
+		}
+		for i := rf.commitIndex; i <= args.LeaderCommit; i++ {
+			log.Printf("Server %v: 提交日志 %v", rf.me, i)
+			rf.applyCh <- ApplyMsg{CommandValid: true, Command: rf.log[i].Log, CommandIndex: i}
+		}
+		rf.commitIndex = args.LeaderCommit
+	}
 	rf.log = append(rf.log, args.Entries...)
 	reply.Append_num = len(args.Entries)
 	reply.Success = true
@@ -505,9 +515,18 @@ func Leader(rf *Raft) {
 					rf.matchIndex[reply.Me] = rf.nextIndex[reply.Me] - 1
 					rf.median_tracker.Add(reply.Me, rf.matchIndex[reply.Me])
 					median := rf.median_tracker.GetMedian()
-					if rf.log[median].Term == rf.currentTerm {
+					if rf.log[median].Term == rf.currentTerm && median > rf.commitIndex {
+						if rf.commitIndex == 0 {
+							rf.commitIndex++
+						}
+						for i := rf.commitIndex; i <= median; i++ {
+							log.Printf("Server %v: 提交日志 %v", rf.me, i)
+							rf.applyCh <- ApplyMsg{CommandValid: true, Command: rf.log[i].Log, CommandIndex: i}
+						}
+
 						rf.commitIndex = median
 					}
+
 					//更新matchindex
 				}
 			}
@@ -633,6 +652,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.applyCh = applyCh
 
 	rf.log = make([]LogEntry, 1)
 	rf.log[0] = LogEntry{Term: 0}
