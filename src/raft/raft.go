@@ -195,7 +195,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	if args.PrevLogIndex > len(rf.log)-1 || args.PrevLogTerm != rf.log[args.PrevLogIndex].Term {
-		// logPrintf("%v %v %v\n", rf.me, args.PrevLogIndex, len(rf.log)-1)
+		// log.Printf("%v %v %v\n", rf.me, args.PrevLogIndex, len(rf.log)-1)
 		//日志不匹配
 		//如果只是简单的对NextIndex逐步减1，则这该测试点很可能不通过。(leader backs up quickly over incorrect follower logs)
 		//两种情况，prevlogindex可能在当前log右边，或者在左边和中间
@@ -212,10 +212,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.commitIndex++
 		}
 		for i := rf.commitIndex; i <= min(args.LeaderCommit, len(rf.log)-1); i++ {
-			// logPrintf("Server %v: 提交日志 %v", rf.me, i)
+			// log.Printf("Server %v: 提交日志 %v", rf.me, i)
 			rf.applyCh <- ApplyMsg{CommandValid: true, Command: rf.log[i].Log, CommandIndex: i}
 		}
-		rf.commitIndex = args.LeaderCommit
+		rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
 	}
 	rf.log = append(rf.log, args.Entries...)
 	reply.Append_num = len(args.Entries)
@@ -223,7 +223,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.heartbeat_timestamp = time.Now().UnixMilli()
 	rf.currentTerm = args.Term
 	rf.state = FOLLOWER
-	// logPrintf("Serve %v: AppendEntries log %v commit %v\n", rf.me, len(rf.log)-1, rf.commitIndex)
+	// log.Printf("Serve %v: AppendEntries log %v commit %v\n", rf.me, len(rf.log)-1, rf.commitIndex)
 
 }
 
@@ -239,10 +239,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	currentTerm := rf.currentTerm
 	reply.Term = currentTerm
-	if args.Term < currentTerm || (args.Term == currentTerm && rf.votedFor != -1) ||
+	if args.Term < currentTerm || (args.Term == currentTerm && rf.votedFor != -1 && rf.votedFor != args.CandidatedId) ||
 		args.LastLogTerm < rf.log[len(rf.log)-1].Term ||
 		args.LastLogIndex < len(rf.log)-1 {
-		// logPrintf("Serve %v: RequestVote %v %v %v %v %v\n", rf.me, args.CandidatedId, args.Term, rf.currentTerm, reply.VoteGranted, rf.votedFor)
+		// log.Printf("Serve %v: RequestVote %v %v %v %v %v\n", rf.me, args.CandidatedId, args.Term, rf.currentTerm, reply.VoteGranted, rf.votedFor)
 		reply.VoteGranted = false
 		return
 	}
@@ -252,7 +252,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.heartbeat_timestamp = time.Now().UnixMilli()
 	rf.currentTerm = args.Term
 	rf.state = FOLLOWER
-	// logPrintf("Serve %v: RequestVote %v %v %v %v %v\n", rf.me, args.CandidatedId, args.Term, rf.currentTerm, reply.VoteGranted, rf.votedFor)
+	// log.Printf("Serve %v: RequestVote %v %v %v %v %v\n", rf.me, args.CandidatedId, args.Term, rf.currentTerm, reply.VoteGranted, rf.votedFor)
 
 }
 
@@ -279,7 +279,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if isLeader {
 		rf.log = append(rf.log, LogEntry{Term: rf.currentTerm, Log: command})
 		rf.median_tracker.Add(rf.me, len(rf.log)-1)
-		// logPrintf("Server %v: Start 是否leader %v, Trf.logerm %v, Index %v\n", rf.me, rf.state == LEADER, rf.currentTerm, len(rf.log))
+		// log.Printf("Server %v: Start 是否leader %v, Term %v, Index %v\n", rf.me, rf.state == LEADER, rf.currentTerm, len(rf.log))
 	}
 
 	return index, term, isLeader
@@ -307,15 +307,21 @@ func Leader(rf *Raft) {
 			}
 
 			//func是按引用捕获
+
+			prevlogindex := rf.nextIndex[i] - 1
+			term := rf.currentTerm
+			prevlogterm := rf.log[rf.nextIndex[i]-1].Term
+			leadercommit := rf.commitIndex
+			entries := make([]LogEntry, 0)
+			if rf.matchIndex[i] != -1 && len(rf.log)-1 >= rf.nextIndex[i] {
+				entries = append(entries, rf.log[rf.nextIndex[i]:]...)
+			}
+
 			go func(server int) {
-				entries := make([]LogEntry, 0)
-				if rf.matchIndex[server] != -1 && len(rf.log)-1 >= rf.nextIndex[server] {
-					entries = append(entries, rf.log[rf.nextIndex[server]:]...)
-				}
-				// logPrintf("Server %v: 向%v发送心跳 prev %v\n", rf.me, server, rf.nextIndex[server]-1)
-				args := AppendEntriesArgs{Term: rf.currentTerm, LeaderId: rf.me,
-					PrevLogIndex: rf.nextIndex[server] - 1, PrevLogTerm: rf.log[rf.nextIndex[server]-1].Term,
-					LeaderCommit: rf.commitIndex,
+				// log.Printf("Server %v: 向%v发送心跳 prev %v\n", rf.me, server, rf.nextIndex[server]-1)
+				args := AppendEntriesArgs{Term: term, LeaderId: rf.me,
+					PrevLogIndex: prevlogindex, PrevLogTerm: prevlogterm,
+					LeaderCommit: leadercommit,
 					Entries:      entries}
 				reply := AppendEntriesReply{}
 				ok := rf.peers[server].Call("Raft.AppendEntries", &args, &reply)
@@ -390,7 +396,7 @@ func Leader(rf *Raft) {
 								rf.commitIndex++
 							}
 							for i := rf.commitIndex; i <= median; i++ {
-								// logPrintf("Server %v: 提交日志 %v", rf.me, i)
+								// log.Printf("Server %v: 提交日志 %v", rf.me, i)
 								rf.applyCh <- ApplyMsg{CommandValid: true, Command: rf.log[i].Log, CommandIndex: i}
 							}
 
@@ -425,7 +431,7 @@ func Candidate(rf *Raft) {
 				continue
 			}
 
-			// logPrintf("Server %v: 向%v发送投票\n", rf.me, i)
+			// log.Printf("Server %v: 向%v发送投票\n", rf.me, i)
 			go func(server int) {
 				reply := RequestVoteReply{}
 				ok := rf.peers[server].Call("Raft.RequestVote", &args, &reply)
@@ -469,7 +475,7 @@ func Candidate(rf *Raft) {
 				if reply.VoteGranted {
 					granted_cnt++
 					if granted_cnt >= (peers_num)/2+1 {
-						// logPrintf("Server %v: 选举成功，进入leader\n", rf.me)
+						// log.Printf("Server %v: 选举成功，进入leader\n", rf.me)
 						Leader(rf)
 						return //若是leader被打为follower直接return到tick
 					}
@@ -499,7 +505,7 @@ func (rf *Raft) ticker() {
 
 		rf.mu.Lock()
 		if time.Since(time.UnixMilli(rf.heartbeat_timestamp)).Milliseconds() > ms {
-			// logPrintf("Serve %v: 等待超时，开始选举\n", rf.me)
+			// log.Printf("Serve %v: 等待超时，开始选举\n", rf.me)
 			//超时
 			//自下向上转换不需要手动添加状态转换
 			Candidate(rf)
