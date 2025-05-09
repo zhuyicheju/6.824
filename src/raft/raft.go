@@ -208,10 +208,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	if args.LeaderCommit > rf.commitIndex {
-		if rf.commitIndex == 0 {
-			rf.commitIndex++
-		}
-		for i := rf.commitIndex; i <= min(args.LeaderCommit, len(rf.log)-1); i++ {
+		for i := rf.commitIndex + 1; i <= min(args.LeaderCommit, len(rf.log)-1); i++ {
 			// log.Printf("Server %v: 提交日志 %v", rf.me, i)
 			rf.applyCh <- ApplyMsg{CommandValid: true, Command: rf.log[i].Log, CommandIndex: i}
 		}
@@ -296,7 +293,7 @@ func Leader(rf *Raft) {
 		rf.nextIndex[i] = len(rf.log)
 	}
 
-	for rf.killed() == false {
+	for !rf.killed() {
 		var rw sync.RWMutex
 		done := false
 		replyCh := make(chan *AppendEntriesReply, peers_num-1)
@@ -392,10 +389,7 @@ func Leader(rf *Raft) {
 						rf.median_tracker.Add(reply.Me, rf.matchIndex[reply.Me])
 						median := rf.median_tracker.GetMedian()
 						if rf.log[median].Term == rf.currentTerm && median > rf.commitIndex {
-							if rf.commitIndex == 0 {
-								rf.commitIndex++
-							}
-							for i := rf.commitIndex; i <= median; i++ {
+							for i := rf.commitIndex + 1; i <= median; i++ {
 								// log.Printf("Server %v: 提交日志 %v", rf.me, i)
 								rf.applyCh <- ApplyMsg{CommandValid: true, Command: rf.log[i].Log, CommandIndex: i}
 							}
@@ -415,7 +409,7 @@ func Candidate(rf *Raft) {
 	//进入时持有锁
 	rf.state = CANDIDATE
 	peers_num := len(rf.peers)
-	for rf.killed() == false {
+	for !rf.killed() {
 		granted_cnt := 1
 		rf.currentTerm++
 		rf.votedFor = rf.me
@@ -497,7 +491,7 @@ func Candidate(rf *Raft) {
 }
 
 func (rf *Raft) ticker() {
-	for rf.killed() == false {
+	for !rf.killed() {
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
 		ms := 300 + (rand.Int63() % 200)
