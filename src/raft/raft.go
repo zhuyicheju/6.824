@@ -224,6 +224,29 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 }
 
+func (rf *Raft) PreRequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+	if rf.killed() {
+		return
+	}
+
+	rf.mu.Lock()
+
+	defer rf.mu.Unlock()
+
+	currentTerm := rf.currentTerm
+	if args.Term < currentTerm || (args.Term == currentTerm && rf.votedFor != -1 && rf.votedFor != args.CandidatedId) ||
+		args.LastLogTerm < rf.log[len(rf.log)-1].Term ||
+		args.LastLogIndex < len(rf.log)-1 {
+		// log.Printf("Serve %v: RequestVote %v %v %v %v %v\n", rf.me, args.CandidatedId, args.Term, rf.currentTerm, reply.VoteGranted, rf.votedFor)
+		reply.VoteGranted = false
+		return
+	}
+
+	reply.VoteGranted = true
+	// log.Printf("Serve %v: RequestVote %v %v %v %v %v\n", rf.me, args.CandidatedId, args.Term, rf.currentTerm, reply.VoteGranted, rf.votedFor)
+
+}
+
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	if rf.killed() {
@@ -405,9 +428,89 @@ func Leader(rf *Raft) {
 	}
 }
 
+func Prevote(rf *Raft) bool {
+	peers_num := len(rf.peers)
+	granted_cnt := 1
+	args := RequestVoteArgs{Term: rf.currentTerm + 1, CandidatedId: rf.me,
+		LastLogIndex: len(rf.log) - 1, LastLogTerm: rf.log[len(rf.log)-1].Term}
+
+	var rw sync.RWMutex
+	done := false
+	replyCh := make(chan *RequestVoteReply, peers_num-1)
+
+	for i := 0; i < peers_num; i++ {
+		if i == rf.me {
+			continue
+		}
+
+		// log.Printf("Server %v: 向%v发送投票\n", rf.me, i)
+		go func(server int) {
+			reply := RequestVoteReply{}
+			ok := rf.peers[server].Call("Raft.RequestVote", &args, &reply)
+
+			var msg *RequestVoteReply
+			if ok {
+				msg = &reply
+			} else {
+				msg = nil
+			}
+
+			rw.RLock()
+			if !done {
+				replyCh <- msg
+			}
+			rw.RUnlock()
+
+		}(i)
+	}
+
+	rf.mu.Unlock()
+
+	ms := 300 + (rand.Int63() % 200)
+	time.Sleep(time.Duration(ms) * time.Millisecond) //选举超时时间
+
+	rw.Lock()
+	done = true
+	close(replyCh)
+	rw.Unlock()
+
+	rf.mu.Lock()
+
+	if rf.state == FOLLOWER {
+		//因接到更高term的rpc
+		return false
+	}
+
+	for i := 0; i < peers_num-1; i++ {
+		reply, ok := <-replyCh
+		if ok && reply != nil {
+			if reply.VoteGranted {
+				granted_cnt++
+				if granted_cnt >= (peers_num)/2+1 {
+					return true
+				}
+			} else {
+				//还有对方任期小，但已投过, 情况
+
+				if reply.Term > rf.currentTerm {
+					return false
+				}
+			}
+		}
+	}
+	return false
+}
+
 func Candidate(rf *Raft) {
 	//进入时持有锁
+
+	//PreVote机制
 	rf.state = CANDIDATE
+	if !Prevote(rf) {
+		rf.state = FOLLOWER
+		return
+	}
+
 	peers_num := len(rf.peers)
 	for !rf.killed() {
 		granted_cnt := 1
