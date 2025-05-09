@@ -184,6 +184,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	// log.Printf("Serve %v: AppendEntries log %v commit %v\n", rf.me, len(rf.log)-1, rf.commitIndex)
 	currentTerm := rf.currentTerm
 	reply.Term = currentTerm
 	reply.Me = rf.me
@@ -193,20 +194,31 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		return
 	}
+	rf.heartbeat_timestamp = time.Now().UnixMilli()
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.state = FOLLOWER
+	}
 
 	if args.PrevLogIndex > len(rf.log)-1 || args.PrevLogTerm != rf.log[args.PrevLogIndex].Term {
 		// log.Printf("%v %v %v\n", rf.me, args.PrevLogIndex, len(rf.log)-1)
 		//日志不匹配
 		//如果只是简单的对NextIndex逐步减1，则这该测试点很可能不通过。(leader backs up quickly over incorrect follower logs)
 		//两种情况，prevlogindex可能在当前log右边，或者在左边和中间
+
 		if len(rf.log) != 1 && args.PrevLogIndex <= len(rf.log)-1 {
 			rf.log = rf.log[:args.PrevLogIndex-1]
 		}
+		// log.Printf("Server %v: 日志不匹配 %v", rf.me, args.PrevLogIndex)
 		reply.Next_index = min(args.PrevLogIndex, len(rf.log))
 		reply.Success = false
 		return
 	}
 
+	rf.log = rf.log[:args.PrevLogIndex+1]
+	rf.log = append(rf.log, args.Entries...)
+	reply.Append_num = len(args.Entries)
+	reply.Success = true
 	if args.LeaderCommit > rf.commitIndex {
 		for i := rf.commitIndex + 1; i <= min(args.LeaderCommit, len(rf.log)-1); i++ {
 			// log.Printf("Server %v: 提交日志 %v", rf.me, i)
@@ -214,13 +226,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
 	}
-	rf.log = append(rf.log, args.Entries...)
-	reply.Append_num = len(args.Entries)
-	reply.Success = true
-	rf.heartbeat_timestamp = time.Now().UnixMilli()
-	rf.currentTerm = args.Term
-	rf.state = FOLLOWER
-	// log.Printf("Serve %v: AppendEntries log %v commit %v\n", rf.me, len(rf.log)-1, rf.commitIndex)
 
 }
 
@@ -236,7 +241,7 @@ func (rf *Raft) PreRequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	currentTerm := rf.currentTerm
 	if args.Term < currentTerm || (args.Term == currentTerm && rf.votedFor != -1 && rf.votedFor != args.CandidatedId) ||
 		args.LastLogTerm < rf.log[len(rf.log)-1].Term ||
-		args.LastLogIndex < len(rf.log)-1 {
+		(args.LastLogTerm == rf.log[len(rf.log)-1].Term && args.LastLogIndex < len(rf.log)-1) {
 		// log.Printf("Serve %v: RequestVote %v %v %v %v %v\n", rf.me, args.CandidatedId, args.Term, rf.currentTerm, reply.VoteGranted, rf.votedFor)
 		reply.VoteGranted = false
 		return
@@ -257,23 +262,29 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	defer rf.mu.Unlock()
 
-	currentTerm := rf.currentTerm
-	reply.Term = currentTerm
-	if args.Term < currentTerm || (args.Term == currentTerm && rf.votedFor != -1 && rf.votedFor != args.CandidatedId) ||
+	reply.Term = rf.currentTerm
+
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.votedFor = -1
+		rf.state = FOLLOWER
+		rf.heartbeat_timestamp = time.Now().UnixMilli()
+	}
+
+	if args.Term < rf.currentTerm ||
+		(rf.votedFor != -1 && rf.votedFor != args.CandidatedId) ||
 		args.LastLogTerm < rf.log[len(rf.log)-1].Term ||
-		args.LastLogIndex < len(rf.log)-1 {
+		(args.LastLogTerm == rf.log[len(rf.log)-1].Term && args.LastLogIndex < len(rf.log)-1) {
+
 		// log.Printf("Serve %v: RequestVote %v %v %v %v %v\n", rf.me, args.CandidatedId, args.Term, rf.currentTerm, reply.VoteGranted, rf.votedFor)
 		reply.VoteGranted = false
 		return
 	}
 
+	rf.heartbeat_timestamp = time.Now().UnixMilli()
 	rf.votedFor = args.CandidatedId
 	reply.VoteGranted = true
-	rf.heartbeat_timestamp = time.Now().UnixMilli()
-	rf.currentTerm = args.Term
-	rf.state = FOLLOWER
 	// log.Printf("Serve %v: RequestVote %v %v %v %v %v\n", rf.me, args.CandidatedId, args.Term, rf.currentTerm, reply.VoteGranted, rf.votedFor)
-
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -299,8 +310,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if isLeader {
 		rf.log = append(rf.log, LogEntry{Term: rf.currentTerm, Log: command})
 		rf.median_tracker.Add(rf.me, len(rf.log)-1)
-		// log.Printf("Server %v: Start 是否leader %v, Term %v, Index %v\n", rf.me, rf.state == LEADER, rf.currentTerm, len(rf.log))
 	}
+	// log.Printf("Server %v: Start 是否leader %v, Term %v, Index %v\n", rf.me, rf.state == LEADER, rf.currentTerm, len(rf.log))
 
 	return index, term, isLeader
 }
