@@ -282,8 +282,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	rf.heartbeat_timestamp = time.Now().UnixMilli()
-	rf.ChangeState(rf.currentTerm, args.CandidatedId, FOLLOWER)
 	reply.VoteGranted = true
+	rf.ChangeState(rf.currentTerm, args.CandidatedId, FOLLOWER)
 	// log.Printf("Serve %v: RequestVote %v %v %v %v %v\n", rf.me, args.CandidatedId, args.Term, rf.currentTerm, reply.VoteGranted, rf.votedFor)
 }
 
@@ -526,7 +526,7 @@ func Candidate(rf *Raft) {
 	peers_num := len(rf.peers)
 	for !rf.killed() {
 		granted_cnt := 1
-		rf.ChangeState(rf.currentTerm+1, rf.me, CANDIDATE)
+		rf.ChangeState(rf.currentTerm+1, rf.me, rf.state)
 		args := RequestVoteArgs{Term: rf.currentTerm, CandidatedId: rf.me,
 			LastLogIndex: len(rf.log) - 1, LastLogTerm: rf.log[len(rf.log)-1].Term}
 
@@ -643,7 +643,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.median_tracker = NewMedianTracker(make([]int, len(rf.peers)))
 
 	rf.heartbeat_timestamp = time.Now().UnixMilli()
-	rf.ChangeState(0, -1, FOLLOWER)
 
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
@@ -679,6 +678,6 @@ func (rf *Raft) killed() bool {
 func (rf *Raft) ChangeState(term int32, votefor int, state int32) {
 	rf.currentTerm = term
 	rf.votedFor = votefor
-	rf.state = state
 	rf.persist()
+	rf.state = state
 }
