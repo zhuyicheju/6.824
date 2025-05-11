@@ -168,6 +168,8 @@ func (rf *Raft) readPersist(data []byte) {
 	rf.currentTerm = currentTerm
 	rf.votedFor = votedFor
 	rf.log = log
+	rf.median_tracker.Add(rf.me, len(rf.log)-1)
+
 }
 
 // the service says it has created a snapshot that has
@@ -198,8 +200,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	rf.heartbeat_timestamp = time.Now().UnixMilli()
 	if args.Term > rf.currentTerm {
-		rf.currentTerm = args.Term
-		rf.state = FOLLOWER
+		rf.ChangeState(args.Term, -1, FOLLOWER)
 	}
 
 	if args.PrevLogIndex > len(rf.log)-1 || args.PrevLogTerm != rf.log[args.PrevLogIndex].Term {
@@ -219,6 +220,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	rf.log = rf.log[:args.PrevLogIndex+1]
 	rf.log = append(rf.log, args.Entries...)
+	rf.persist()
 	reply.Append_num = len(args.Entries)
 	reply.Success = true
 	if args.LeaderCommit > rf.commitIndex {
@@ -267,9 +269,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.Term = rf.currentTerm
 
 	if args.Term > rf.currentTerm {
-		rf.currentTerm = args.Term
-		rf.votedFor = -1
-		rf.state = FOLLOWER
+		rf.ChangeState(args.Term, -1, FOLLOWER)
 		rf.heartbeat_timestamp = time.Now().UnixMilli()
 	}
 
@@ -284,8 +284,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	rf.heartbeat_timestamp = time.Now().UnixMilli()
-	rf.votedFor = args.CandidatedId
-	reply.VoteGranted = true
+	rf.ChangeState(rf.currentTerm, args.CandidatedId, FOLLOWER)
 	// log.Printf("Serve %v: RequestVote %v %v %v %v %v\n", rf.me, args.CandidatedId, args.Term, rf.currentTerm, reply.VoteGranted, rf.votedFor)
 }
 
@@ -312,6 +311,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if isLeader {
 		rf.log = append(rf.log, LogEntry{Term: rf.currentTerm, Log: command})
 		rf.median_tracker.Add(rf.me, len(rf.log)-1)
+		rf.persist()
 	}
 	// log.Printf("Server %v: Start 是否leader %v, Term %v, Index %v\n", rf.me, rf.state == LEADER, rf.currentTerm, len(rf.log))
 
@@ -405,9 +405,7 @@ func Leader(rf *Raft) {
 
 				if rf.currentTerm < reply.Term {
 					//任期过期
-					rf.currentTerm = reply.Term
-					rf.state = FOLLOWER
-					rf.votedFor = -1
+					rf.ChangeState(reply.Term, -1, FOLLOWER)
 					//持有锁退出
 					return
 				}
@@ -527,8 +525,7 @@ func Candidate(rf *Raft) {
 	peers_num := len(rf.peers)
 	for !rf.killed() {
 		granted_cnt := 1
-		rf.currentTerm++
-		rf.votedFor = rf.me
+		rf.ChangeState(rf.currentTerm+1, rf.me, CANDIDATE)
 		args := RequestVoteArgs{Term: rf.currentTerm, CandidatedId: rf.me,
 			LastLogIndex: len(rf.log) - 1, LastLogTerm: rf.log[len(rf.log)-1].Term}
 
@@ -594,9 +591,7 @@ func Candidate(rf *Raft) {
 
 					if reply.Term > rf.currentTerm {
 						//对方任期大
-						rf.currentTerm = reply.Term
-						rf.state = FOLLOWER
-						rf.votedFor = -1
+						rf.ChangeState(reply.Term, -1, FOLLOWER)
 						return //降为follower
 					}
 				}
@@ -646,10 +641,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.median_tracker = NewMedianTracker(make([]int, len(rf.peers)))
 
-	rf.currentTerm = 0
-	rf.votedFor = -1
 	rf.heartbeat_timestamp = time.Now().UnixMilli()
-	rf.state = FOLLOWER
+	rf.ChangeState(0, -1, FOLLOWER)
 
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
@@ -680,4 +673,11 @@ func (rf *Raft) Kill() {
 func (rf *Raft) killed() bool {
 	z := atomic.LoadInt32(&rf.dead)
 	return z == 1
+}
+
+func (rf *Raft) ChangeState(term int32, votefor int, state int32) {
+	rf.currentTerm = term
+	rf.votedFor = votefor
+	rf.state = state
+	rf.persist()
 }
