@@ -208,7 +208,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		//两种情况，prevlogindex可能在当前log右边，或者在左边和中间
 
 		if len(rf.log) != 1 && args.PrevLogIndex <= len(rf.log)-1 {
-			rf.log = rf.log[:args.PrevLogIndex-1]
+			rf.log = rf.log[:args.PrevLogIndex]
 		}
 		// log.Printf("Server %v: 日志不匹配 %v", rf.me, args.PrevLogIndex)
 		reply.Next_index = min(args.PrevLogIndex, len(rf.log))
@@ -216,9 +216,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	rf.log = rf.log[:args.PrevLogIndex+1]
-	rf.log = append(rf.log, args.Entries...)
-	rf.persist()
+	for i := range args.Entries {
+		if args.PrevLogIndex+i+1 > len(rf.log)-1 {
+			rf.log = append(rf.log, args.Entries[i:]...)
+			rf.persist()
+			break
+		}
+		if rf.log[args.PrevLogIndex+i+1].Term != args.Entries[i].Term {
+			rf.log = rf.log[:args.PrevLogIndex+i+1]
+			rf.log = append(rf.log, args.Entries[i:]...)
+			rf.persist()
+			break
+		}
+	}
 	reply.Append_num = len(args.Entries)
 	reply.Success = true
 	if args.LeaderCommit > rf.commitIndex {
@@ -320,6 +330,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func Leader(rf *Raft) {
 	//进入时持有锁
 	rf.state = LEADER
+
+	// //no-op机制
+	// rf.log = append(rf.log, LogEntry{Term: rf.currentTerm, Log: nil})
+	// rf.persist()
+	// rf.median_tracker.Add(rf.me, len(rf.log)-1)
+
 	peers_num := len(rf.peers)
 
 	rf.median_tracker.Add(rf.me, len(rf.log)-1)
@@ -347,7 +363,7 @@ func Leader(rf *Raft) {
 			prevlogterm := rf.log[rf.nextIndex[i]-1].Term
 			leadercommit := rf.commitIndex
 			entries := make([]LogEntry, 0)
-			if rf.matchIndex[i] != -1 && len(rf.log)-1 >= rf.nextIndex[i] {
+			if len(rf.log)-1 >= rf.nextIndex[i] {
 				entries = append(entries, rf.log[rf.nextIndex[i]:]...)
 			}
 
@@ -562,7 +578,7 @@ func Candidate(rf *Raft) {
 
 		rf.mu.Unlock()
 
-		ms := 300 + (rand.Int63() % 200)
+		ms := 200 + (rand.Int63() % 300)
 		time.Sleep(time.Duration(ms) * time.Millisecond) //选举超时时间
 
 		rw.Lock()
