@@ -168,8 +168,6 @@ func (rf *Raft) readPersist(data []byte) {
 	rf.currentTerm = currentTerm
 	rf.votedFor = votedFor
 	rf.log = log
-	rf.median_tracker.Add(rf.me, len(rf.log)-1)
-
 }
 
 // the service says it has created a snapshot that has
@@ -285,6 +283,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	rf.heartbeat_timestamp = time.Now().UnixMilli()
 	rf.ChangeState(rf.currentTerm, args.CandidatedId, FOLLOWER)
+	reply.VoteGranted = true
 	// log.Printf("Serve %v: RequestVote %v %v %v %v %v\n", rf.me, args.CandidatedId, args.Term, rf.currentTerm, reply.VoteGranted, rf.votedFor)
 }
 
@@ -310,8 +309,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	if isLeader {
 		rf.log = append(rf.log, LogEntry{Term: rf.currentTerm, Log: command})
-		rf.median_tracker.Add(rf.me, len(rf.log)-1)
 		rf.persist()
+		rf.median_tracker.Add(rf.me, len(rf.log)-1)
 	}
 	// log.Printf("Server %v: Start 是否leader %v, Term %v, Index %v\n", rf.me, rf.state == LEADER, rf.currentTerm, len(rf.log))
 
@@ -322,6 +321,8 @@ func Leader(rf *Raft) {
 	//进入时持有锁
 	rf.state = LEADER
 	peers_num := len(rf.peers)
+
+	rf.median_tracker.Add(rf.me, len(rf.log)-1)
 
 	for i := range rf.matchIndex {
 		//初始化每个数组的匹配日志
