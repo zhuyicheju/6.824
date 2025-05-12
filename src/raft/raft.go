@@ -328,6 +328,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // if it's ever committed. the second return value is the current
 // term. the third return value is true if this server believes it is
 // the leader.
+
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -350,10 +351,10 @@ func Leader(rf *Raft) {
 	//进入时持有锁
 	rf.state = LEADER
 
-	// //no-op机制
-	// rf.log = append(rf.log, LogEntry{Term: rf.currentTerm, Log: nil})
-	// rf.persist()
-	// rf.median_tracker.Add(rf.me, len(rf.log)-1)
+	//no-op机制
+	rf.log = append(rf.log, LogEntry{Term: rf.currentTerm, Log: nil})
+	rf.persist()
+	rf.median_tracker.Add(rf.me, len(rf.log)-1)
 
 	peers_num := len(rf.peers)
 
@@ -479,7 +480,7 @@ func Leader(rf *Raft) {
 						median := rf.median_tracker.GetMedian()
 						if rf.log[median].Term == rf.currentTerm && median > rf.commitIndex {
 							// for i := rf.commitIndex + 1; i <= median; i++ {
-							// 	// log.Printf("Server %v: 提交日志 %v", rf.me, i)
+							// log.Printf("Server %v: 提交日志 %v", rf.me, i)
 							// 	rf.applyCh <- ApplyMsg{CommandValid: true, Command: rf.log[i].Log, CommandIndex: i}
 							// }
 							commitLog := rf.log[rf.commitIndex+1 : median+1]
@@ -618,7 +619,7 @@ func Candidate(rf *Raft) {
 
 		rf.mu.Unlock()
 
-		ms := 200 + (rand.Int63() % 300)
+		ms := 300 + (rand.Int63() % 200)
 		time.Sleep(time.Duration(ms) * time.Millisecond) //选举超时时间
 
 		rw.Lock()
