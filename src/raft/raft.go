@@ -90,6 +90,9 @@ type Raft struct {
 	state int
 
 	median_tracker *MedianTracker
+
+	done bool
+	rw   sync.RWMutex
 }
 
 type RequestVoteArgs struct {
@@ -123,6 +126,8 @@ type AppendEntriesReply struct {
 	Append_num    int
 	ConflictIndex int
 	ConflictTerm  int
+	PrevLogIndex  int
+	LeaderTerm    int
 }
 
 // return currentTerm and whether this server
@@ -197,6 +202,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	currentTerm := rf.currentTerm
 	reply.Term = currentTerm
 	reply.Me = rf.me
+	reply.PrevLogIndex = args.PrevLogIndex
+	reply.LeaderTerm = args.Term
 
 	if args.Term < currentTerm {
 		//任期过低
@@ -329,6 +336,95 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // term. the third return value is true if this server believes it is
 // the leader.
 
+func (rf *Raft) ReceiveReply(stop chan struct{}, replyCh chan *AppendEntriesReply, done *bool) {
+	for {
+		select {
+		case <-stop:
+			rf.rw.Lock()
+			*done = true
+			close(replyCh)
+			rf.rw.Unlock()
+			return
+		case reply := <-replyCh:
+			if reply == nil {
+				break
+			}
+			rf.mu.Lock()
+
+			//reply类型 success term
+			//正常成功   true    ==
+			//任期过期   false   >
+			//日志冲突   false   ==  term相同，日志不一致，prevLogIndex 或 prevLogTerm 处与 leader 不匹配。
+			//日志太短   false   ==  leader 给出的 prevLogIndex 超过了跟随者日志的末尾。
+			if reply.LeaderTerm != rf.currentTerm {
+				rf.mu.Unlock()
+				break
+			}
+
+			if rf.state == FOLLOWER {
+				//因接到更高term的rpc
+				rf.mu.Unlock()
+				return
+			}
+			if rf.currentTerm < reply.Term {
+				//任期过期
+				rf.ChangeState(reply.Term, -1, FOLLOWER)
+				//持有锁退出
+				rf.mu.Unlock()
+				return
+			}
+
+			if !reply.Success {
+				//日志冲突&日志太短
+
+				//寻找leader和follower一致日志
+				if reply.ConflictTerm == 0 {
+					rf.nextIndex[reply.Me] = reply.ConflictIndex
+				} else {
+					l := 0
+					r := len(rf.log)
+					for l+1 < r {
+						mid := (l + r) / 2
+						if rf.log[mid].Term <= reply.ConflictTerm {
+							l = mid
+						} else {
+							r = mid
+						}
+					}
+					i := l // 最后一个<=term的下标
+					if rf.log[i].Term == reply.ConflictTerm {
+						rf.nextIndex[reply.Me] = i + 1
+					} else {
+						rf.nextIndex[reply.Me] = reply.ConflictIndex
+					}
+				}
+			} else {
+				//正常成功
+				rf.nextIndex[reply.Me] = reply.PrevLogIndex + reply.Append_num + 1
+				rf.matchIndex[reply.Me] = rf.nextIndex[reply.Me] - 1
+				if reply.Append_num != 0 {
+					rf.median_tracker.Add(reply.Me, rf.matchIndex[reply.Me])
+					median := rf.median_tracker.GetMedian()
+					if rf.log[median].Term == rf.currentTerm && median > rf.commitIndex {
+						// for i := rf.commitIndex + 1; i <= median; i++ {
+						// // log.Printf("Server %v: 提交日志", rf.me)
+						// 	rf.applyCh <- ApplyMsg{CommandValid: true, Command: rf.log[i].Log, CommandIndex: i}
+						// }
+						commitLog := rf.log[rf.commitIndex+1 : median+1]
+						go ParallelCommit(rf.applyCh, rf.commitIndex+1, commitLog)
+
+						rf.commitIndex = median
+					}
+				}
+
+				//更新matchindex
+			}
+
+			rf.mu.Unlock()
+		}
+	}
+}
+
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -352,9 +448,9 @@ func Leader(rf *Raft) {
 	rf.state = LEADER
 
 	//no-op机制
-	rf.log = append(rf.log, LogEntry{Term: rf.currentTerm, Log: nil})
-	rf.persist()
-	rf.median_tracker.Add(rf.me, len(rf.log)-1)
+	// rf.log = append(rf.log, LogEntry{Term: rf.currentTerm, Log: nil})
+	// rf.persist()
+	// rf.median_tracker.Add(rf.me, len(rf.log)-1)
 
 	peers_num := len(rf.peers)
 
@@ -366,10 +462,12 @@ func Leader(rf *Raft) {
 		rf.nextIndex[i] = len(rf.log)
 	}
 
+	done := false
+	replyCh := make(chan *AppendEntriesReply, 2*peers_num)
+	stopCh := make(chan struct{})
+	go rf.ReceiveReply(stopCh, replyCh, &done)
+
 	for !rf.killed() {
-		var rw sync.RWMutex
-		done := false
-		replyCh := make(chan *AppendEntriesReply, peers_num-1)
 
 		for i := 0; i < peers_num; i++ {
 			if i == rf.me {
@@ -403,11 +501,11 @@ func Leader(rf *Raft) {
 					msg = nil
 				}
 
-				rw.RLock()
+				rf.rw.RLock()
 				if !done {
 					replyCh <- msg
 				}
-				rw.RUnlock()
+				rf.rw.RUnlock()
 			}(i)
 		}
 
@@ -417,83 +515,15 @@ func Leader(rf *Raft) {
 		//每秒<=10次beat
 		time.Sleep(time.Duration(ms) * time.Millisecond) //选举超时时间
 
-		rw.Lock()
-		done = true
-		close(replyCh)
-		rw.Unlock()
-
 		rf.mu.Lock()
 
 		if rf.state == FOLLOWER {
 			//因接到更高term的rpc
 			//持有锁退出
+			close(stopCh)
 			return
 		}
 
-		for i := 0; i < peers_num-1; i++ {
-			reply, ok := <-replyCh
-			if ok && reply != nil {
-
-				//reply类型 success term
-				//正常成功   true    ==
-				//任期过期   false   >
-				//日志冲突   false   ==  term相同，日志不一致，prevLogIndex 或 prevLogTerm 处与 leader 不匹配。
-				//日志太短   false   ==  leader 给出的 prevLogIndex 超过了跟随者日志的末尾。
-
-				if rf.currentTerm < reply.Term {
-					//任期过期
-					rf.ChangeState(reply.Term, -1, FOLLOWER)
-					//持有锁退出
-					return
-				}
-
-				if !reply.Success {
-					//日志冲突&日志太短
-
-					//寻找leader和follower一致日志
-					if reply.ConflictTerm == 0 {
-						rf.nextIndex[reply.Me] = reply.ConflictIndex
-					} else {
-						l := 0
-						r := len(rf.log)
-						for l+1 < r {
-							mid := (l + r) / 2
-							if rf.log[mid].Term <= reply.ConflictTerm {
-								l = mid
-							} else {
-								r = mid
-							}
-						}
-						i := l // 最后一个<=term的下标
-						if rf.log[i].Term == reply.ConflictTerm {
-							rf.nextIndex[reply.Me] = i + 1
-						} else {
-							rf.nextIndex[reply.Me] = reply.ConflictIndex
-						}
-					}
-				} else {
-					//正常成功
-					rf.nextIndex[reply.Me] += reply.Append_num
-					rf.matchIndex[reply.Me] = rf.nextIndex[reply.Me] - 1
-					if reply.Append_num != 0 {
-						rf.median_tracker.Add(reply.Me, rf.matchIndex[reply.Me])
-						median := rf.median_tracker.GetMedian()
-						if rf.log[median].Term == rf.currentTerm && median > rf.commitIndex {
-							// for i := rf.commitIndex + 1; i <= median; i++ {
-							// log.Printf("Server %v: 提交日志 %v", rf.me, i)
-							// 	rf.applyCh <- ApplyMsg{CommandValid: true, Command: rf.log[i].Log, CommandIndex: i}
-							// }
-							commitLog := rf.log[rf.commitIndex+1 : median+1]
-							go ParallelCommit(rf.applyCh, rf.commitIndex+1, commitLog)
-
-							rf.commitIndex = median
-						}
-					}
-
-					//更新matchindex
-				}
-			}
-		}
 	}
 }
 
