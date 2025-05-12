@@ -230,12 +230,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply.ConflictIndex = len(rf.log)
 		} else {
 			reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
-			for i := args.PrevLogTerm; ; i-- {
-				if i == 0 || rf.log[i].Term != rf.log[args.PrevLogIndex].Term {
-					reply.ConflictIndex = i + 1
-					break
+			l := 0
+			r := len(rf.log)
+			for l+1 < r {
+				mid := (l + r) / 2
+				if rf.log[mid].Term >= reply.ConflictTerm {
+					r = mid
+				} else {
+					l = mid
 				}
 			}
+			reply.ConflictIndex = r // 第一=term的下标
 		}
 		reply.Success = false
 		return
@@ -693,7 +698,7 @@ func (rf *Raft) ticker() {
 	for !rf.killed() {
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
-		ms := 300 + (rand.Int63() % 200)
+		ms := 500 + (rand.Int63() % 1000)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 
 		rf.mu.Lock()
