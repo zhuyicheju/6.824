@@ -53,7 +53,7 @@ type ApplyMsg struct {
 }
 
 type LogEntry struct {
-	Term int32
+	Term int
 	Log  interface{}
 }
 
@@ -72,7 +72,7 @@ type Raft struct {
 	dead      int32               // set by Kill()
 	applyCh   chan ApplyMsg
 
-	currentTerm int32
+	currentTerm int
 	votedFor    int
 
 	log []LogEntry // need to be implented
@@ -87,29 +87,29 @@ type Raft struct {
 
 	heartbeat_timestamp int64
 
-	state int32
+	state int
 
 	median_tracker *MedianTracker
 }
 
 type RequestVoteArgs struct {
-	Term         int32
+	Term         int
 	CandidatedId int
 	LastLogIndex int
-	LastLogTerm  int32
+	LastLogTerm  int
 }
 
 type RequestVoteReply struct {
-	Term        int32
+	Term        int
 	VoteGranted bool
 }
 
 type AppendEntriesArgs struct {
-	Term     int32
+	Term     int
 	LeaderId int
 
 	PrevLogIndex int
-	PrevLogTerm  int32
+	PrevLogTerm  int
 
 	Entries []LogEntry
 
@@ -117,11 +117,12 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Me         int
-	Term       int32
-	Success    bool
-	Append_num int
-	Next_index int
+	Me            int
+	Term          int
+	Success       bool
+	Append_num    int
+	ConflictIndex int
+	ConflictTerm  int
 }
 
 // return currentTerm and whether this server
@@ -156,7 +157,7 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
-	var currentTerm int32
+	var currentTerm int
 	var votedFor int
 	var log []LogEntry
 	if d.Decode(&currentTerm) != nil ||
@@ -211,7 +212,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.log = rf.log[:args.PrevLogIndex]
 		}
 		// log.Printf("Server %v: 日志不匹配 %v", rf.me, args.PrevLogIndex)
-		reply.Next_index = min(args.PrevLogIndex, len(rf.log))
+		reply.ConflictIndex = min(args.PrevLogIndex, len(rf.log))
+		if args.PrevLogIndex >= len(rf.log) {
+			reply.ConflictIndex = len(rf.log)
+		} else {
+			reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
+			for i := args.PrevLogTerm; ; i-- {
+				if i == 0 || rf.log[i].Term != rf.log[args.PrevLogIndex].Term {
+					reply.ConflictIndex = i + 1
+					break
+				}
+			}
+		}
 		reply.Success = false
 		return
 	}
@@ -431,7 +443,19 @@ func Leader(rf *Raft) {
 					//日志冲突&日志太短
 
 					//寻找leader和follower一致日志
-					rf.nextIndex[reply.Me] = reply.Next_index
+					if reply.ConflictTerm == 0 {
+						rf.nextIndex[reply.Me] = reply.ConflictIndex
+					} else {
+						var i int
+						for i = len(rf.log) - 1; rf.log[i].Term > reply.ConflictTerm; i-- {
+
+						}
+						if rf.log[i].Term == reply.ConflictTerm {
+							rf.nextIndex[reply.Me] = i + 1
+						} else {
+							rf.nextIndex[reply.Me] = reply.ConflictIndex
+						}
+					}
 				} else {
 					//正常成功
 					rf.nextIndex[reply.Me] += reply.Append_num
@@ -691,7 +715,7 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-func (rf *Raft) ChangeState(term int32, votefor int, state int32) {
+func (rf *Raft) ChangeState(term int, votefor int, state int) {
 	rf.currentTerm = term
 	rf.votedFor = votefor
 	rf.persist()
