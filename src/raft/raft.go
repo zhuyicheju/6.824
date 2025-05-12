@@ -231,7 +231,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		} else {
 			reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
 			l := 0
-			r := len(rf.log)
+			r := args.PrevLogIndex + 1
 			for l+1 < r {
 				mid := (l + r) / 2
 				if rf.log[mid].Term >= reply.ConflictTerm {
@@ -387,7 +387,7 @@ func (rf *Raft) ReceiveReply(stop chan struct{}, replyCh chan *AppendEntriesRepl
 					rf.nextIndex[reply.Me] = reply.ConflictIndex
 				} else {
 					l := 0
-					r := len(rf.log)
+					r := reply.PrevLogIndex
 					for l+1 < r {
 						mid := (l + r) / 2
 						if rf.log[mid].Term <= reply.ConflictTerm {
@@ -396,9 +396,8 @@ func (rf *Raft) ReceiveReply(stop chan struct{}, replyCh chan *AppendEntriesRepl
 							r = mid
 						}
 					}
-					i := l // 最后一个<=term的下标
-					if rf.log[i].Term == reply.ConflictTerm {
-						rf.nextIndex[reply.Me] = i + 1
+					if rf.log[l].Term == reply.ConflictTerm {
+						rf.nextIndex[reply.Me] = l + 1 // 最后一个<=term的下标
 					} else {
 						rf.nextIndex[reply.Me] = reply.ConflictIndex
 					}
