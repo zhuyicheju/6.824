@@ -180,6 +180,12 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
+func ParallelCommit(applyCh chan ApplyMsg, index int, log []LogEntry) {
+	for i := range log {
+		applyCh <- ApplyMsg{CommandValid: true, Command: log[i].Log, CommandIndex: i + index}
+	}
+}
+
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	if rf.killed() {
 		return
@@ -244,10 +250,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Append_num = len(args.Entries)
 	reply.Success = true
 	if args.LeaderCommit > rf.commitIndex {
-		for i := rf.commitIndex + 1; i <= min(args.LeaderCommit, len(rf.log)-1); i++ {
-			// log.Printf("Server %v: 提交日志 %v", rf.me, i)
-			rf.applyCh <- ApplyMsg{CommandValid: true, Command: rf.log[i].Log, CommandIndex: i}
-		}
+		// for i := rf.commitIndex + 1; i <= min(args.LeaderCommit, len(rf.log)-1); i++ {
+		// 	rf.applyCh <- ApplyMsg{CommandValid: true, Command: rf.log[i].Log, CommandIndex: i}
+		// }
+		commitlog := rf.log[rf.commitIndex+1 : min(args.LeaderCommit, len(rf.log)-1)+1]
+		go ParallelCommit(rf.applyCh, rf.commitIndex+1, commitlog)
 		rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
 	}
 
@@ -446,10 +453,17 @@ func Leader(rf *Raft) {
 					if reply.ConflictTerm == 0 {
 						rf.nextIndex[reply.Me] = reply.ConflictIndex
 					} else {
-						var i int
-						for i = len(rf.log) - 1; rf.log[i].Term > reply.ConflictTerm; i-- {
-
+						l := 0
+						r := len(rf.log)
+						for l+1 < r {
+							mid := (l + r) / 2
+							if rf.log[mid].Term <= reply.ConflictTerm {
+								l = mid
+							} else {
+								r = mid
+							}
 						}
+						i := l // 最后一个<=term的下标
 						if rf.log[i].Term == reply.ConflictTerm {
 							rf.nextIndex[reply.Me] = i + 1
 						} else {
@@ -464,10 +478,12 @@ func Leader(rf *Raft) {
 						rf.median_tracker.Add(reply.Me, rf.matchIndex[reply.Me])
 						median := rf.median_tracker.GetMedian()
 						if rf.log[median].Term == rf.currentTerm && median > rf.commitIndex {
-							for i := rf.commitIndex + 1; i <= median; i++ {
-								// log.Printf("Server %v: 提交日志 %v", rf.me, i)
-								rf.applyCh <- ApplyMsg{CommandValid: true, Command: rf.log[i].Log, CommandIndex: i}
-							}
+							// for i := rf.commitIndex + 1; i <= median; i++ {
+							// 	// log.Printf("Server %v: 提交日志 %v", rf.me, i)
+							// 	rf.applyCh <- ApplyMsg{CommandValid: true, Command: rf.log[i].Log, CommandIndex: i}
+							// }
+							commitLog := rf.log[rf.commitIndex+1 : median+1]
+							go ParallelCommit(rf.applyCh, rf.commitIndex+1, commitLog)
 
 							rf.commitIndex = median
 						}
