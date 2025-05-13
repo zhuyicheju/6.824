@@ -249,14 +249,12 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	// cut := rf.TrueIdx2FakeIdx(index + 1)
-	// if cut < len(rf.log) {
-	// 	rf.log = rf.log[cut:]
-	// } else {
-	// 	rf.log = []LogEntry{}
-	// }
+	if rf.TrueIdx2FakeIdx(index) < len(rf.log) {
+		//如果进入，则是被动调用snapshot
+		//如果没有进入，则为follower接收日志后自己调用snapshot，所以缺少最后一个term
+		rf.snapshotTerm = rf.log[rf.TrueIdx2FakeIdx(index)].Term
+	}
 
-	rf.snapshotTerm = rf.log[rf.TrueIdx2FakeIdx(index)].Term
 	cut := rf.TrueIdx2FakeIdx(index + 1)
 	if cut < len(rf.log) {
 		newLog := make([]LogEntry, len(rf.log[cut:]))
@@ -272,10 +270,6 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.commitIndex = max(rf.commitIndex, index)
 	rf.persist()
 	fmt.Printf("Server %v: Snapshot %v %v\n", rf.me, index, len(rf.log)-1)
-	// log 0 1 2 3
-	// index 5
-	// snapshot 4
-	// cur 2, 3
 }
 
 func (rf *Raft) ParallelCommit(index int, log []LogEntry) {
@@ -379,6 +373,8 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	reply.Me = rf.me
 	reply.Term = rf.currentTerm
 	reply.Newindex = args.LastIncludedIndex
+
+	rf.snapshotTerm = args.LastIncludedTerm
 
 	rf.heartbeat_timestamp = time.Now().UnixMilli()
 
