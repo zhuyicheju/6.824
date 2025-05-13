@@ -21,6 +21,8 @@ import (
 	//	"bytes"
 
 	"bytes"
+	"fmt"
+	"log"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -139,7 +141,7 @@ type InstallSnapshotArgs struct {
 	LeaderId          int
 	LastIncludedIndex int
 	LastIncludedTerm  int
-	data              []byte
+	Data              []byte
 }
 
 type InstallSnapshotReply struct {
@@ -169,6 +171,7 @@ func (rf *Raft) persist() {
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.snapshotIndex)
+	e.Encode(rf.snapshotTerm)
 	e.Encode(rf.log)
 	e.Encode(rf.snapshot)
 	raftstate := w.Bytes()
@@ -185,11 +188,13 @@ func (rf *Raft) readPersist(data []byte) {
 	var currentTerm int
 	var votedFor int
 	var snapshotIndex int
+	var snapshotTerm int
 	var log []LogEntry
 	var snapshot []byte
 	if d.Decode(&currentTerm) != nil ||
 		d.Decode(&votedFor) != nil ||
 		d.Decode(&snapshotIndex) != nil ||
+		d.Decode(&snapshotTerm) != nil ||
 		d.Decode(&log) != nil ||
 		d.Decode(&snapshot) != nil {
 		panic("持久化状态解码错误")
@@ -241,13 +246,23 @@ func (rf *Raft) TermIndex(index int) int {
 // service no longer needs the log through (and including)
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	fmt.Printf("Server %v: Snapshot %v\n", rf.me, index)
 
 	rf.snapshotIndex = index
 	rf.snapshot = snapshot
 	rf.snapshotTerm = rf.log[rf.TrueIdx2FakeIdx(index)].Term
 
-	rf.log = rf.log[min(len(rf.log), index-rf.snapshotIndex+1):]
-	rf.log = append([]LogEntry{{Term: -1}}, rf.log...)
+	cut := rf.TrueIdx2FakeIdx(index + 1)
+	if cut < len(rf.log) {
+		rf.log = rf.log[cut:]
+	} else {
+		rf.log = []LogEntry{}
+	}
+
+	rf.log = append([]LogEntry{{Term: 0}}, rf.log...)
 
 	rf.commitIndex = max(rf.commitIndex, index)
 	rf.persist()
@@ -257,9 +272,10 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// cur 2, 3
 }
 
-func ParallelCommit(applyCh chan ApplyMsg, index int, log []LogEntry) {
+func (rf *Raft) ParallelCommit(index int, log []LogEntry) {
 	for i := range log {
-		applyCh <- ApplyMsg{CommandValid: true, Command: log[i].Log, CommandIndex: i + index}
+		fmt.Printf("server %v :提交日志%v\n", rf.me, i+index)
+		rf.applyCh <- ApplyMsg{CommandValid: true, Command: log[i].Log, CommandIndex: i + index}
 	}
 }
 
@@ -270,7 +286,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	// log.Printf("Serve %v: AppendEntries log %v commit %v\n", rf.me, len(rf.log)-1, rf.commitIndex)
+	fmt.Printf("Serve %v: AppendEntries log %v commit %v\n", rf.me, rf.FakeIdx2TrueIdx(len(rf.log)-1), rf.commitIndex)
 	currentTerm := rf.currentTerm
 	reply.Term = currentTerm
 	reply.Me = rf.me
@@ -287,18 +303,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.ChangeState(args.Term, -1, FOLLOWER)
 	}
 
-	if rf.TrueIdx2FakeIdx(args.PrevLogIndex) > len(rf.log)-1 || args.PrevLogTerm != rf.TermIndex(args.PrevLogIndex) {
+	if args.PrevLogIndex > rf.FakeIdx2TrueIdx(len(rf.log)-1) || args.PrevLogTerm != rf.TermIndex(args.PrevLogIndex) {
 		// log.Printf("%v %v %v\n", rf.me, args.PrevLogIndex, len(rf.log)-1)
 		//日志不匹配
 		//如果只是简单的对NextIndex逐步减1，则这该测试点很可能不通过。(leader backs up quickly over incorrect follower logs)
 		//两种情况，prevlogindex可能在当前log右边，或者在左边和中间
 
-		if len(rf.log) != 1 && rf.TrueIdx2FakeIdx(args.PrevLogIndex) <= len(rf.log)-1 {
+		if len(rf.log) != 1 && args.PrevLogIndex <= rf.FakeIdx2TrueIdx(len(rf.log)-1) {
 			rf.log = rf.log[:rf.TrueIdx2FakeIdx(args.PrevLogIndex)]
 		}
 		// log.Printf("Server %v: 日志不匹配 %v", rf.me, args.PrevLogIndex)
 		reply.ConflictIndex = min(args.PrevLogIndex, rf.FakeIdx2TrueIdx(len(rf.log)))
-		if rf.TrueIdx2FakeIdx(args.PrevLogIndex) >= len(rf.log) {
+		if args.PrevLogIndex >= rf.FakeIdx2TrueIdx(len(rf.log)) {
 			reply.ConflictIndex = rf.FakeIdx2TrueIdx(len(rf.log))
 		} else {
 			reply.ConflictTerm = rf.TermIndex(args.PrevLogIndex)
@@ -337,18 +353,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// for i := rf.commitIndex + 1; i <= min(args.LeaderCommit, len(rf.log)-1); i++ {
 		// 	rf.applyCh <- ApplyMsg{CommandValid: true, Command: rf.log[i].Log, CommandIndex: i}
 		// }
-		commitlog := rf.log[rf.commitIndex+1 : min(args.LeaderCommit, len(rf.log)-1)+1]
-		go ParallelCommit(rf.applyCh, rf.commitIndex+1, commitlog)
-		rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
+		commitlog := rf.log[rf.TrueIdx2FakeIdx(rf.commitIndex+1) : min(rf.TrueIdx2FakeIdx(args.LeaderCommit), len(rf.log)-1)+1]
+		go rf.ParallelCommit(rf.commitIndex+1, commitlog)
+		rf.commitIndex = min(args.LeaderCommit, rf.FakeIdx2TrueIdx(len(rf.log)-1))
 	}
 
 }
 
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
+
+	log.Printf("Server %v: installsnapshot\n", rf.me)
 
 	if args.Term < rf.currentTerm {
+		rf.mu.Unlock()
 		return
 	}
 
@@ -356,7 +374,14 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	reply.Term = rf.currentTerm
 	reply.Newindex = args.LastIncludedIndex
 
-	rf.Snapshot(args.LastIncludedIndex, args.data)
+	rf.heartbeat_timestamp = time.Now().UnixMilli()
+
+	fmt.Printf("server %v :提交快照%v\n", rf.me, args.LastIncludedIndex)
+	rf.applyCh <- ApplyMsg{SnapshotValid: true, Snapshot: args.Data, SnapshotTerm: args.LastIncludedTerm, SnapshotIndex: args.LastIncludedIndex}
+
+	rf.mu.Unlock()
+	//在无锁调用
+	rf.Snapshot(args.LastIncludedIndex, args.Data)
 }
 
 func (rf *Raft) PreRequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
@@ -513,12 +538,9 @@ func (rf *Raft) ReceiveReply(stop chan struct{}, entries_replyCh chan *AppendEnt
 					rf.median_tracker.Add(reply.Me, rf.matchIndex[reply.Me])
 					median := rf.median_tracker.GetMedian()
 					if rf.TermIndex(median) == rf.currentTerm && median > rf.commitIndex {
-						// for i := rf.commitIndex + 1; i <= median; i++ {
-						// // log.Printf("Server %v: 提交日志", rf.me)
-						// 	rf.applyCh <- ApplyMsg{CommandValid: true, Command: rf.log[i].Log, CommandIndex: i}
-						// }
+						// log.Printf("Server %v: 提交日志", rf.me)
 						commitLog := rf.log[rf.TrueIdx2FakeIdx(rf.commitIndex+1):rf.TrueIdx2FakeIdx(median+1)]
-						go ParallelCommit(rf.applyCh, rf.commitIndex+1, commitLog)
+						go rf.ParallelCommit(rf.commitIndex+1, commitLog)
 
 						rf.commitIndex = median
 					}
@@ -545,9 +567,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.log = append(rf.log, LogEntry{Term: rf.currentTerm, Log: command})
 		rf.persist()
 		rf.median_tracker.Add(rf.me, rf.FakeIdx2TrueIdx(len(rf.log)-1))
-	}
-	// log.Printf("Server %v: Start 是否leader %v, Term %v, Index %v\n", rf.me, rf.state == LEADER, rf.currentTerm, len(rf.log))
+		fmt.Printf("Server %v: Start 是否leader %v, Term %v, Index %v\n", rf.me, rf.state == LEADER, rf.currentTerm, rf.FakeIdx2TrueIdx(len(rf.log))-1)
 
+	}
+	//
 	return index, term, isLeader
 }
 
@@ -567,7 +590,7 @@ func Leader(rf *Raft) {
 	for i := range rf.matchIndex {
 		//初始化每个数组的匹配日志
 		rf.matchIndex[i] = -1
-		rf.nextIndex[i] = rf.TrueIdx2FakeIdx(len(rf.log))
+		rf.nextIndex[i] = rf.FakeIdx2TrueIdx(len(rf.log))
 	}
 
 	done := false
@@ -588,15 +611,16 @@ func Leader(rf *Raft) {
 			if rf.nextIndex[i] > rf.snapshotIndex {
 				prevlogindex := rf.nextIndex[i] - 1
 				term := rf.currentTerm
-				prevlogterm := rf.TermIndex(rf.nextIndex[i] - 1)
+				prevlogterm := rf.TermIndex(prevlogindex)
 				leadercommit := rf.commitIndex
 				entries := make([]LogEntry, 0)
-				if len(rf.log)-1 >= rf.TrueIdx2FakeIdx(rf.nextIndex[i]) {
+				fmt.Printf("%v %v %v \n", len(rf.log)-1, rf.FakeIdx2TrueIdx(len(rf.log)-1), rf.nextIndex[i])
+				if rf.FakeIdx2TrueIdx(len(rf.log)-1) >= rf.nextIndex[i] {
 					entries = append(entries, rf.log[rf.TrueIdx2FakeIdx(rf.nextIndex[i]):]...)
 				}
 
 				go func(server int) {
-					// log.Printf("Server %v: 向%v发送心跳 prev %v\n", rf.me, server, rf.nextIndex[server]-1)
+					fmt.Printf("Server %v: 向%v发送心跳 prev %v len:%v\n", rf.me, server, rf.nextIndex[server]-1, len(entries))
 					args := AppendEntriesArgs{Term: term, LeaderId: rf.me,
 						PrevLogIndex: prevlogindex, PrevLogTerm: prevlogterm,
 						LeaderCommit: leadercommit,
@@ -619,14 +643,9 @@ func Leader(rf *Raft) {
 				}(i)
 			} else {
 				go func(server int) {
-					// log.Printf("Server %v: 向%v发送快照 prev %v\n", rf.me, server, rf.nextIndex[server]-1)
-					// args := AppendEntriesArgs{Term: term, LeaderId: rf.me,
-					// 	PrevLogIndex: prevlogindex, PrevLogTerm: prevlogterm,
-					// 	LeaderCommit: leadercommit,
-					// 	Entries:      entries}
-					// reply := AppendEntriesReply{}
+					fmt.Printf("Server %v: 向%v发送快照 prev %v last: %v\n", rf.me, server, rf.nextIndex[server]-1, rf.snapshotIndex)
 					args := InstallSnapshotArgs{Term: rf.currentTerm, LeaderId: rf.me,
-						LastIncludedIndex: rf.snapshotIndex, data: rf.snapshot}
+						LastIncludedIndex: rf.snapshotIndex, Data: rf.snapshot, LastIncludedTerm: rf.snapshotTerm}
 					reply := InstallSnapshotReply{}
 					ok := rf.peers[server].Call("Raft.InstallSnapshot", &args, &reply)
 
@@ -807,7 +826,7 @@ func Candidate(rf *Raft) {
 				if reply.VoteGranted {
 					granted_cnt++
 					if granted_cnt >= (peers_num)/2+1 {
-						// log.Printf("Server %v: 选举成功，进入leader\n", rf.me)
+						fmt.Printf("Server %v: 选举成功，进入leader\n", rf.me)
 						Leader(rf)
 						return //若是leader被打为follower直接return到tick
 					}
