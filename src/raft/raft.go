@@ -77,6 +77,10 @@ type Raft struct {
 
 	log []LogEntry // need to be implented
 
+	snapshot      []byte
+	snapshotIndex int
+	snapshotTerm  int
+
 	commitIndex int
 	lastApplied int
 
@@ -130,6 +134,20 @@ type AppendEntriesReply struct {
 	LeaderTerm    int
 }
 
+type InstallSnapshotArgs struct {
+	Term              int
+	LeaderId          int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	data              []byte
+}
+
+type InstallSnapshotReply struct {
+	Me       int
+	Term     int
+	Newindex int
+}
+
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
@@ -150,7 +168,9 @@ func (rf *Raft) persist() {
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
+	e.Encode(rf.snapshotIndex)
 	e.Encode(rf.log)
+	e.Encode(rf.snapshot)
 	raftstate := w.Bytes()
 	rf.persister.Save(raftstate, nil)
 }
@@ -164,16 +184,56 @@ func (rf *Raft) readPersist(data []byte) {
 	d := labgob.NewDecoder(r)
 	var currentTerm int
 	var votedFor int
+	var snapshotIndex int
 	var log []LogEntry
+	var snapshot []byte
 	if d.Decode(&currentTerm) != nil ||
 		d.Decode(&votedFor) != nil ||
-		d.Decode(&log) != nil {
+		d.Decode(&snapshotIndex) != nil ||
+		d.Decode(&log) != nil ||
+		d.Decode(&snapshot) != nil {
 		panic("持久化状态解码错误")
 	}
 
 	rf.currentTerm = currentTerm
 	rf.votedFor = votedFor
+	rf.snapshotIndex = snapshotIndex
 	rf.log = log
+	rf.snapshot = snapshot
+}
+
+// 日志总长度，不包括空索引
+func (rf *Raft) LogLen() int {
+	return len(rf.log) - 1 + rf.snapshotIndex
+}
+
+// 日志总索引转当前索引
+func (rf *Raft) TrueIdx2FakeIdx(index int) int {
+	return index - rf.snapshotIndex
+}
+
+// 当前索引转日志总索引
+func (rf *Raft) FakeIdx2TrueIdx(index int) int {
+	return index + rf.snapshotIndex
+}
+
+// 获得最后一个日志的Term
+func (rf *Raft) LastLogTerm() int {
+	if len(rf.log) <= 1 {
+		return rf.snapshotTerm
+	}
+	return rf.log[len(rf.log)-1].Term
+}
+
+func (rf *Raft) TermIndex(index int) int {
+	if index > rf.snapshotIndex {
+		return rf.log[rf.TrueIdx2FakeIdx(index)].Term
+	}
+	if index == rf.snapshotIndex {
+		return rf.snapshotTerm
+	}
+
+	panic("错误获取快照日志")
 }
 
 // the service says it has created a snapshot that has
@@ -181,8 +241,20 @@ func (rf *Raft) readPersist(data []byte) {
 // service no longer needs the log through (and including)
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	// Your code here (3D).
 
+	rf.snapshotIndex = index
+	rf.snapshot = snapshot
+	rf.snapshotTerm = rf.log[rf.TrueIdx2FakeIdx(index)].Term
+
+	rf.log = rf.log[min(len(rf.log), index-rf.snapshotIndex+1):]
+	rf.log = append([]LogEntry{{Term: -1}}, rf.log...)
+
+	rf.commitIndex = max(rf.commitIndex, index)
+	rf.persist()
+	// log 0 1 2 3
+	// index 5
+	// snapshot 4
+	// cur 2, 3
 }
 
 func ParallelCommit(applyCh chan ApplyMsg, index int, log []LogEntry) {
@@ -215,23 +287,23 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.ChangeState(args.Term, -1, FOLLOWER)
 	}
 
-	if args.PrevLogIndex > len(rf.log)-1 || args.PrevLogTerm != rf.log[args.PrevLogIndex].Term {
+	if rf.TrueIdx2FakeIdx(args.PrevLogIndex) > len(rf.log)-1 || args.PrevLogTerm != rf.TermIndex(args.PrevLogIndex) {
 		// log.Printf("%v %v %v\n", rf.me, args.PrevLogIndex, len(rf.log)-1)
 		//日志不匹配
 		//如果只是简单的对NextIndex逐步减1，则这该测试点很可能不通过。(leader backs up quickly over incorrect follower logs)
 		//两种情况，prevlogindex可能在当前log右边，或者在左边和中间
 
-		if len(rf.log) != 1 && args.PrevLogIndex <= len(rf.log)-1 {
-			rf.log = rf.log[:args.PrevLogIndex]
+		if len(rf.log) != 1 && rf.TrueIdx2FakeIdx(args.PrevLogIndex) <= len(rf.log)-1 {
+			rf.log = rf.log[:rf.TrueIdx2FakeIdx(args.PrevLogIndex)]
 		}
 		// log.Printf("Server %v: 日志不匹配 %v", rf.me, args.PrevLogIndex)
-		reply.ConflictIndex = min(args.PrevLogIndex, len(rf.log))
-		if args.PrevLogIndex >= len(rf.log) {
-			reply.ConflictIndex = len(rf.log)
+		reply.ConflictIndex = min(args.PrevLogIndex, rf.FakeIdx2TrueIdx(len(rf.log)))
+		if rf.TrueIdx2FakeIdx(args.PrevLogIndex) >= len(rf.log) {
+			reply.ConflictIndex = rf.FakeIdx2TrueIdx(len(rf.log))
 		} else {
-			reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
+			reply.ConflictTerm = rf.TermIndex(args.PrevLogIndex)
 			l := 0
-			r := args.PrevLogIndex + 1
+			r := rf.TrueIdx2FakeIdx(args.PrevLogIndex) + 1
 			for l+1 < r {
 				mid := (l + r) / 2
 				if rf.log[mid].Term >= reply.ConflictTerm {
@@ -240,20 +312,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 					l = mid
 				}
 			}
-			reply.ConflictIndex = r // 第一=term的下标
+			reply.ConflictIndex = rf.FakeIdx2TrueIdx(r) // 第一=term的下标
 		}
 		reply.Success = false
 		return
 	}
 
 	for i := range args.Entries {
-		if args.PrevLogIndex+i+1 > len(rf.log)-1 {
+		if args.PrevLogIndex+i+1 > rf.FakeIdx2TrueIdx(len(rf.log)-1) {
 			rf.log = append(rf.log, args.Entries[i:]...)
 			rf.persist()
 			break
 		}
-		if rf.log[args.PrevLogIndex+i+1].Term != args.Entries[i].Term {
-			rf.log = rf.log[:args.PrevLogIndex+i+1]
+		if rf.TermIndex(args.PrevLogIndex+i+1) != args.Entries[i].Term {
+			rf.log = rf.log[:rf.TrueIdx2FakeIdx(args.PrevLogIndex+i+1)]
 			rf.log = append(rf.log, args.Entries[i:]...)
 			rf.persist()
 			break
@@ -272,6 +344,21 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 }
 
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if args.Term < rf.currentTerm {
+		return
+	}
+
+	reply.Me = rf.me
+	reply.Term = rf.currentTerm
+	reply.Newindex = args.LastIncludedIndex
+
+	rf.Snapshot(args.LastIncludedIndex, args.data)
+}
+
 func (rf *Raft) PreRequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if rf.killed() {
 		return
@@ -283,8 +370,8 @@ func (rf *Raft) PreRequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	currentTerm := rf.currentTerm
 	if args.Term < currentTerm || (args.Term == currentTerm && rf.votedFor != -1 && rf.votedFor != args.CandidatedId) ||
-		args.LastLogTerm < rf.log[len(rf.log)-1].Term ||
-		(args.LastLogTerm == rf.log[len(rf.log)-1].Term && args.LastLogIndex < len(rf.log)-1) {
+		args.LastLogTerm < rf.LastLogTerm() ||
+		(args.LastLogTerm == rf.LastLogTerm() && rf.TrueIdx2FakeIdx(args.LastLogIndex) < len(rf.log)-1) {
 		// log.Printf("Serve %v: RequestVote %v %v %v %v %v\n", rf.me, args.CandidatedId, args.Term, rf.currentTerm, reply.VoteGranted, rf.votedFor)
 		reply.VoteGranted = false
 		return
@@ -314,8 +401,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	if args.Term < rf.currentTerm ||
 		(rf.votedFor != -1 && rf.votedFor != args.CandidatedId) ||
-		args.LastLogTerm < rf.log[len(rf.log)-1].Term ||
-		(args.LastLogTerm == rf.log[len(rf.log)-1].Term && args.LastLogIndex < len(rf.log)-1) {
+		args.LastLogTerm < rf.LastLogTerm() ||
+		(args.LastLogTerm == rf.LastLogTerm() && rf.TrueIdx2FakeIdx(args.LastLogIndex) < len(rf.log)-1) {
 
 		// log.Printf("Serve %v: RequestVote %v %v %v %v %v\n", rf.me, args.CandidatedId, args.Term, rf.currentTerm, reply.VoteGranted, rf.votedFor)
 		reply.VoteGranted = false
@@ -341,16 +428,32 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // term. the third return value is true if this server believes it is
 // the leader.
 
-func (rf *Raft) ReceiveReply(stop chan struct{}, replyCh chan *AppendEntriesReply, done *bool) {
+func (rf *Raft) ReceiveReply(stop chan struct{}, entries_replyCh chan *AppendEntriesReply, snapshot_replyCh chan *InstallSnapshotReply, done *bool) {
 	for {
 		select {
 		case <-stop:
 			rf.rw.Lock()
 			*done = true
-			close(replyCh)
+			close(entries_replyCh)
+			close(snapshot_replyCh)
 			rf.rw.Unlock()
 			return
-		case reply := <-replyCh:
+		case reply := <-snapshot_replyCh:
+			if reply == nil {
+				break
+			}
+			rf.mu.Lock()
+
+			if reply.Term > rf.currentTerm {
+				rf.ChangeState(reply.Term, -1, FOLLOWER)
+				rf.mu.Unlock()
+				return
+			}
+
+			rf.nextIndex[reply.Me] = reply.Newindex + 1
+			rf.matchIndex[reply.Me] = reply.Newindex
+
+		case reply := <-entries_replyCh:
 			if reply == nil {
 				break
 			}
@@ -387,7 +490,7 @@ func (rf *Raft) ReceiveReply(stop chan struct{}, replyCh chan *AppendEntriesRepl
 					rf.nextIndex[reply.Me] = reply.ConflictIndex
 				} else {
 					l := 0
-					r := reply.PrevLogIndex
+					r := rf.TrueIdx2FakeIdx(reply.PrevLogIndex)
 					for l+1 < r {
 						mid := (l + r) / 2
 						if rf.log[mid].Term <= reply.ConflictTerm {
@@ -397,7 +500,7 @@ func (rf *Raft) ReceiveReply(stop chan struct{}, replyCh chan *AppendEntriesRepl
 						}
 					}
 					if rf.log[l].Term == reply.ConflictTerm {
-						rf.nextIndex[reply.Me] = l + 1 // 最后一个<=term的下标
+						rf.nextIndex[reply.Me] = rf.FakeIdx2TrueIdx(l + 1) // 最后一个<=term的下标
 					} else {
 						rf.nextIndex[reply.Me] = reply.ConflictIndex
 					}
@@ -409,12 +512,12 @@ func (rf *Raft) ReceiveReply(stop chan struct{}, replyCh chan *AppendEntriesRepl
 				if reply.Append_num != 0 {
 					rf.median_tracker.Add(reply.Me, rf.matchIndex[reply.Me])
 					median := rf.median_tracker.GetMedian()
-					if rf.log[median].Term == rf.currentTerm && median > rf.commitIndex {
+					if rf.TermIndex(median) == rf.currentTerm && median > rf.commitIndex {
 						// for i := rf.commitIndex + 1; i <= median; i++ {
 						// // log.Printf("Server %v: 提交日志", rf.me)
 						// 	rf.applyCh <- ApplyMsg{CommandValid: true, Command: rf.log[i].Log, CommandIndex: i}
 						// }
-						commitLog := rf.log[rf.commitIndex+1 : median+1]
+						commitLog := rf.log[rf.TrueIdx2FakeIdx(rf.commitIndex+1):rf.TrueIdx2FakeIdx(median+1)]
 						go ParallelCommit(rf.applyCh, rf.commitIndex+1, commitLog)
 
 						rf.commitIndex = median
@@ -425,6 +528,7 @@ func (rf *Raft) ReceiveReply(stop chan struct{}, replyCh chan *AppendEntriesRepl
 			}
 
 			rf.mu.Unlock()
+
 		}
 	}
 }
@@ -433,14 +537,14 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	index := len(rf.log)
+	index := rf.FakeIdx2TrueIdx(len(rf.log))
 	term := int(rf.currentTerm)
 	isLeader := (rf.state == LEADER)
 
 	if isLeader {
 		rf.log = append(rf.log, LogEntry{Term: rf.currentTerm, Log: command})
 		rf.persist()
-		rf.median_tracker.Add(rf.me, len(rf.log)-1)
+		rf.median_tracker.Add(rf.me, rf.FakeIdx2TrueIdx(len(rf.log)-1))
 	}
 	// log.Printf("Server %v: Start 是否leader %v, Term %v, Index %v\n", rf.me, rf.state == LEADER, rf.currentTerm, len(rf.log))
 
@@ -458,18 +562,19 @@ func Leader(rf *Raft) {
 
 	peers_num := len(rf.peers)
 
-	rf.median_tracker.Add(rf.me, len(rf.log)-1)
+	rf.median_tracker.Add(rf.me, rf.FakeIdx2TrueIdx(len(rf.log)-1))
 
 	for i := range rf.matchIndex {
 		//初始化每个数组的匹配日志
 		rf.matchIndex[i] = -1
-		rf.nextIndex[i] = len(rf.log)
+		rf.nextIndex[i] = rf.TrueIdx2FakeIdx(len(rf.log))
 	}
 
 	done := false
-	replyCh := make(chan *AppendEntriesReply, 2*peers_num)
+	entries_replyCh := make(chan *AppendEntriesReply, 2*peers_num)
+	snapshot_replyCh := make(chan *InstallSnapshotReply, 2*peers_num)
 	stopCh := make(chan struct{})
-	go rf.ReceiveReply(stopCh, replyCh, &done)
+	go rf.ReceiveReply(stopCh, entries_replyCh, snapshot_replyCh, &done)
 
 	for !rf.killed() {
 
@@ -480,37 +585,65 @@ func Leader(rf *Raft) {
 
 			//func是按引用捕获
 
-			prevlogindex := rf.nextIndex[i] - 1
-			term := rf.currentTerm
-			prevlogterm := rf.log[rf.nextIndex[i]-1].Term
-			leadercommit := rf.commitIndex
-			entries := make([]LogEntry, 0)
-			if len(rf.log)-1 >= rf.nextIndex[i] {
-				entries = append(entries, rf.log[rf.nextIndex[i]:]...)
+			if rf.nextIndex[i] > rf.snapshotIndex {
+				prevlogindex := rf.nextIndex[i] - 1
+				term := rf.currentTerm
+				prevlogterm := rf.TermIndex(rf.nextIndex[i] - 1)
+				leadercommit := rf.commitIndex
+				entries := make([]LogEntry, 0)
+				if len(rf.log)-1 >= rf.TrueIdx2FakeIdx(rf.nextIndex[i]) {
+					entries = append(entries, rf.log[rf.TrueIdx2FakeIdx(rf.nextIndex[i]):]...)
+				}
+
+				go func(server int) {
+					// log.Printf("Server %v: 向%v发送心跳 prev %v\n", rf.me, server, rf.nextIndex[server]-1)
+					args := AppendEntriesArgs{Term: term, LeaderId: rf.me,
+						PrevLogIndex: prevlogindex, PrevLogTerm: prevlogterm,
+						LeaderCommit: leadercommit,
+						Entries:      entries}
+					reply := AppendEntriesReply{}
+					ok := rf.peers[server].Call("Raft.AppendEntries", &args, &reply)
+
+					var msg *AppendEntriesReply
+					if ok {
+						msg = &reply
+					} else {
+						msg = nil
+					}
+
+					rf.rw.RLock()
+					if !done {
+						entries_replyCh <- msg
+					}
+					rf.rw.RUnlock()
+				}(i)
+			} else {
+				go func(server int) {
+					// log.Printf("Server %v: 向%v发送快照 prev %v\n", rf.me, server, rf.nextIndex[server]-1)
+					// args := AppendEntriesArgs{Term: term, LeaderId: rf.me,
+					// 	PrevLogIndex: prevlogindex, PrevLogTerm: prevlogterm,
+					// 	LeaderCommit: leadercommit,
+					// 	Entries:      entries}
+					// reply := AppendEntriesReply{}
+					args := InstallSnapshotArgs{Term: rf.currentTerm, LeaderId: rf.me,
+						LastIncludedIndex: rf.snapshotIndex, data: rf.snapshot}
+					reply := InstallSnapshotReply{}
+					ok := rf.peers[server].Call("Raft.InstallSnapshot", &args, &reply)
+
+					var msg *InstallSnapshotReply
+					if ok {
+						msg = &reply
+					} else {
+						msg = nil
+					}
+
+					rf.rw.RLock()
+					if !done {
+						snapshot_replyCh <- msg
+					}
+					rf.rw.RUnlock()
+				}(i)
 			}
-
-			go func(server int) {
-				// log.Printf("Server %v: 向%v发送心跳 prev %v\n", rf.me, server, rf.nextIndex[server]-1)
-				args := AppendEntriesArgs{Term: term, LeaderId: rf.me,
-					PrevLogIndex: prevlogindex, PrevLogTerm: prevlogterm,
-					LeaderCommit: leadercommit,
-					Entries:      entries}
-				reply := AppendEntriesReply{}
-				ok := rf.peers[server].Call("Raft.AppendEntries", &args, &reply)
-
-				var msg *AppendEntriesReply
-				if ok {
-					msg = &reply
-				} else {
-					msg = nil
-				}
-
-				rf.rw.RLock()
-				if !done {
-					replyCh <- msg
-				}
-				rf.rw.RUnlock()
-			}(i)
 		}
 
 		rf.mu.Unlock()
@@ -535,7 +668,7 @@ func Prevote(rf *Raft) bool {
 	peers_num := len(rf.peers)
 	granted_cnt := 1
 	args := RequestVoteArgs{Term: rf.currentTerm + 1, CandidatedId: rf.me,
-		LastLogIndex: len(rf.log) - 1, LastLogTerm: rf.log[len(rf.log)-1].Term}
+		LastLogIndex: rf.FakeIdx2TrueIdx(len(rf.log) - 1), LastLogTerm: rf.LastLogTerm()}
 
 	var rw sync.RWMutex
 	done := false
@@ -619,7 +752,7 @@ func Candidate(rf *Raft) {
 		granted_cnt := 1
 		rf.ChangeState(rf.currentTerm+1, rf.me, rf.state)
 		args := RequestVoteArgs{Term: rf.currentTerm, CandidatedId: rf.me,
-			LastLogIndex: len(rf.log) - 1, LastLogTerm: rf.log[len(rf.log)-1].Term}
+			LastLogIndex: rf.FakeIdx2TrueIdx(len(rf.log) - 1), LastLogTerm: rf.LastLogTerm()}
 
 		var rw sync.RWMutex
 		done := false
