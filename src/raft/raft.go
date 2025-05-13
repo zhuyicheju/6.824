@@ -249,23 +249,29 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	fmt.Printf("Server %v: Snapshot %v\n", rf.me, index)
+	// cut := rf.TrueIdx2FakeIdx(index + 1)
+	// if cut < len(rf.log) {
+	// 	rf.log = rf.log[cut:]
+	// } else {
+	// 	rf.log = []LogEntry{}
+	// }
+
+	rf.snapshotTerm = rf.log[rf.TrueIdx2FakeIdx(index)].Term
+	cut := rf.TrueIdx2FakeIdx(index + 1)
+	if cut < len(rf.log) {
+		newLog := make([]LogEntry, len(rf.log[cut:]))
+		copy(newLog, rf.log[cut:])
+		rf.log = append([]LogEntry{{Term: 0}}, newLog...)
+	} else {
+		rf.log = []LogEntry{{Term: 0}}
+	}
 
 	rf.snapshotIndex = index
 	rf.snapshot = snapshot
-	rf.snapshotTerm = rf.log[rf.TrueIdx2FakeIdx(index)].Term
-
-	cut := rf.TrueIdx2FakeIdx(index + 1)
-	if cut < len(rf.log) {
-		rf.log = rf.log[cut:]
-	} else {
-		rf.log = []LogEntry{}
-	}
-
-	rf.log = append([]LogEntry{{Term: 0}}, rf.log...)
 
 	rf.commitIndex = max(rf.commitIndex, index)
 	rf.persist()
+	fmt.Printf("Server %v: Snapshot %v %v\n", rf.me, index, len(rf.log)-1)
 	// log 0 1 2 3
 	// index 5
 	// snapshot 4
